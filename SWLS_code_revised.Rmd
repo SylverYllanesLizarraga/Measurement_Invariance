@@ -1,0 +1,2124 @@
+---
+title: "Measurement Invariance of the SWLS"
+author: "Sylver Yllanes-Lizarraga"
+
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    self_contained: true
+  pdf_document:
+    toc: true
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Libraries
+
+```{r, message=FALSE, warning=FALSE}
+library(haven)
+library(foreign)
+library(writexl)
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+
+library(table1)
+library(naniar)
+library(corrr)
+library(corrplot)
+
+
+library(lavaan)
+library(semTools)
+
+library(effsize)
+library(confintr)
+```
+
+
+# Auxiliary
+
+`compare_incl`, to compare included and excluded participants and `compare_vars` to do multiple at one time
+
+```{r}
+compare_incl = function(x, g) {
+  g = factor(g)
+  if (is.numeric(x)) {
+    tibble(test = "t.test", stat = unname(t.test(x ~ g)$statistic),
+                            p = t.test(x ~ g)$p.value,
+           effect = "Cohen's d", size = cohen.d(x ~ g)$estimate) }
+  else {ch = chisq.test(table(droplevels(factor(x)), g))
+  tibble(test = "Chi-squared", stat = unname(ch$statistic),
+                               p = ch$p.value,
+         effect = "Cramer's V", size = cramersv(ch)) } }
+
+compare_vars = \(data, vars, group) {
+  bind_rows(sapply(vars, \(v) compare_incl(data[[v]], data[[group]]),
+                   simplify = FALSE), .id = "variable") }
+```
+
+`fit_diff`, to compare fit indices
+
+```{r}
+fit_diff <- function(fit1, fit2) {
+  lrt <- lavTestLRT(fit1, fit2)
+  data.frame(D.chisq = round(lrt$`Chisq diff`[2], 2),
+             D.df = lrt$`Df diff`[2],
+             pvalue = signif(lrt$`Pr(>Chisq)`[2], 3),
+             D.cfi = round(unname(fitMeasures(fit2, "cfi.scaled") -
+                                   fitMeasures(fit1, "cfi.scaled")), 3),
+             D.rmsea = round(unname(fitMeasures(fit2, "rmsea.scaled") -
+                                     fitMeasures(fit1, "rmsea.scaled")), 3))}
+```
+
+Vectors with fit indices' names
+
+```{r}
+names_fit = c("chisq.scaled", "df.scaled", "cfi.scaled",
+              "rmsea.scaled", "rmsea.ci.lower.scaled",
+              "rmsea.ci.upper.scaled", "srmr")
+
+names_short = c("chisq", "df", "chisq/df", "cfi", "rmsea",
+                "ci.lower", "ci.upper", "srmr")
+```
+
+# I. Data preparation
+
+## 1. Data selection
+
+Import the data
+
+```{r, message=FALSE, warning=FALSE}
+d0 = read.spss("TBIMS_cleaned2.sav", use.value.labels = T, to.data.frame = T)
+```
+
+Select the sociodemographic and test variables
+
+```{r}
+swls0 = d0 %>%
+  select(c("UID", "Age", "Race", "Sex", "Mar", "EduYears",
+           "Cause", "CTComp", "GCSTot",
+           names(d0)[grepl("^FUYear", names(d0))],
+           names(d0)[grepl("^SWLS", names(d0))]))
+```
+
+Remove "SWLSTOT", as it's not a raw item
+
+```{r}
+swls0 = swls0 %>%
+  select(-names(d0)[grepl("SWLSTOT", names(d0))])
+```
+
+Recode items into (1) Strongly disagree, (2) Disagree, (3) Slightly disagree, (4) Neither agree nor disagree, (5) Slightly agree, (6) Agree, (7) Strongly agree, and NA (any other number, and NA)
+
+```{r}
+swls0 <- swls0 %>%
+  mutate(across(
+    matches("SWLS"),
+    ~ factor(.x, ordered = TRUE,
+             levels = c("Strongly Disagree", "Disagree", "Slightly Disagree",
+                        "Neither Agree nor Disagree", "Slightly Agree",
+                        "Agree", "Strongly Agree"))))
+```
+
+## 2. Group selection
+
+Create columns for missing data
+
+```{r}
+swls0 <- swls0 %>%
+  mutate(
+    missing_T1 = rowSums(across(contains("SWLS") & ends_with(".1"), is.na)),
+    missing_T2 = rowSums(across(contains("SWLS") & ends_with(".2"), is.na)),
+    missing_T3 = rowSums(across(contains("SWLS") & ends_with(".3"), is.na)),
+    missing_T4 = rowSums(across(contains("SWLS") & ends_with(".4"), is.na)),
+    missing_T5 = rowSums(across(contains("SWLS") & ends_with(".5"), is.na)),
+    missing_T6 = rowSums(across(contains("SWLS") & ends_with(".6"), is.na)),
+    missing_T7 = rowSums(across(contains("SWLS") & ends_with(".7"), is.na)) )
+```
+
+Check missing data
+
+```{r}
+swls0 %>%
+  select(starts_with("missing_T")) %>%
+  sapply(\(x) table(cut(x, c(-Inf, 0, 4, 5),
+                        labels = c("0", "1-4", "5")), useNA = "always"))
+```
+
+**Cross-sectional**
+
+Check number of complete data for each timepoint (divided by race)
+
+```{r}
+swls0 %>%
+  group_by(Race) %>%
+  summarise(
+    n = n(),
+    timepoint_1 = sum(missing_T1 == 0, na.rm = TRUE),
+    timepoint_2 = sum(missing_T2 == 0, na.rm = TRUE),
+    timepoint_3 = sum(missing_T3 == 0, na.rm = TRUE),
+    timepoint_4 = sum(missing_T4 == 0, na.rm = TRUE),
+    timepoint_5 = sum(missing_T5 == 0, na.rm = TRUE),
+    timepoint_6 = sum(missing_T6 == 0, na.rm = TRUE),
+    timepoint_7 = sum(missing_T7 == 0, na.rm = TRUE)) %>%
+  arrange(desc(n))
+```
+
+::: {style="background-color:#fff3cd;             border-left:6px solid #ffcc00;             padding:12px;             margin:10px 0;"}
+**Available cross-sectional data:**
+
+- White, Black and Hispanic patients
+- Timepoints 1, 2, 3 and 4
+- Lowest n=208
+:::
+
+**Longitudinal**
+
+Check number of complete data for each race (divided by T1, T1+T2...)
+
+```{r}
+swls0 %>%
+  group_by(Race) %>%
+  summarise(
+    n = n(),
+    timepoint_1 = sum(missing_T1 == 0, na.rm = TRUE),
+    timepoint_1_2 = sum(missing_T1 == 0 & missing_T2 == 0, na.rm = TRUE),
+    timepoint_1_2_3 = sum(missing_T1 == 0 & missing_T2 == 0 & missing_T3 == 0, na.rm = TRUE),
+    timepoint_1_2_3_4 = sum(missing_T1 == 0 & missing_T2 == 0 & missing_T3 == 0 & missing_T4 == 0, na.rm = TRUE) ) %>%
+  arrange(desc(n))
+```
+
+::: {style="background-color:#fff3cd;             border-left:6px solid #ffcc00;             padding:12px;             margin:10px 0;"}
+**Available longitudinal data:**
+
+- White, Black and Hispanic patients
+- Timepoints 1, 2 and 3
+- Lowest n=253
+:::
+
+
+## 3. Final dataset
+
+**Selected data**
+
+```{r}
+swls = swls0[swls0$Race %in% c("White", "Black", "Hispanic Orgin"),
+                 c(1:9, # sociodemographic
+                   which(grepl("\\.(1|2|3)$", names(swls0))) )]
+swls$Race <- droplevels(swls$Race)
+```
+
+**Proportions per timepoint**
+
+```{r}
+proportions = swls %>%
+  select(matches("^SWLS.+\\.(1|2|3)$")) %>%
+  pivot_longer(everything(), names_to = c("item", "timepoint"),
+               names_sep = "\\.", values_to = "response") %>%
+  drop_na(response) %>%
+  count(item, timepoint, response, .drop = FALSE) %>%
+  group_by(item, timepoint) %>%
+  mutate(prop = round(n / sum(n), 2)) %>%
+  ungroup() %>%
+  pivot_wider(id_cols = item, names_from = c(response, timepoint),
+              values_from = prop, names_sort = TRUE)
+```
+
+**Years of data collection**
+
+Amount of NAs
+
+```{r}
+sapply(swls[grepl("^FUYear", names(swls))],
+       function(x) c(data = sum(!is.na(x)),
+                     NAs = sum(is.na(x)),
+                     pctNA = round(mean(is.na(x)) * 100,2)))
+```
+Range of years
+
+```{r}
+sapply(swls[grepl("^FUYear", names(swls))], range, na.rm = TRUE)
+```
+
+## Remove objects
+
+```{r}
+rm(d0, swls0, swlsINCL)
+```
+
+# II. Cross-sectional MI
+
+## 1. One year after TBI
+
+### Pre-analysis
+
+**Included vs excluded**
+
+```{r}
+T1_swlsINCL = swls %>%
+  mutate(status = ifelse(if_all(matches("SWLS.*\\.1$"), ~ !is.na(.)), 1, 0)) %>%
+  mutate(status = factor(status, labels = c("excluded", "included")))
+
+rbind(freq = table(T1_swlsINCL$status, useNA="ifany"),
+      pct = round(prop.table(table(T1_swlsINCL$status, useNA="ifany"))*100,2))
+```
+
+Descriptive statistics
+
+```{r}
+table1( ~ Sex + Age + Race + Mar + EduYears +
+          Cause + GCSTot + CTComp | status,
+        data = T1_swlsINCL)
+```
+
+Differences per variable
+
+```{r}
+T1diff = compare_vars(T1_swlsINCL, c("Sex", "Age", "Race", "Mar", "EduYears",
+                 "Cause", "GCSTot", "CTComp"), "status")
+
+T1diff %>%
+  mutate(across(c(stat, size), \(x) round(x, 4)))
+```
+
+**Selected sample**
+
+Create the sub-dataset
+
+```{r}
+T1_swls <- swls %>%
+  filter(Race %in% c("White", "Black", "Hispanic Orgin"),
+         if_all(matches("SWLS.*\\.1$"), ~ !is.na(.)) ) %>%
+  select(1:9,
+         matches("SWLS.*\\.1$"))
+nrow(T1_swls)
+```
+
+Create the model
+
+```{r}
+T1_mod = 'Satisfaction =~ SWLSIdeal.1 + SWLSCond.1 + SWLSSAt.1
+                        + SWLSImprt.1 + SWLSLiveOver.1'
+```
+
+Descriptive statistics 
+
+```{r}
+T1desc = table1( ~ Sex + Age + Race + Mar + EduYears +
+          Cause + GCSTot + CTComp,
+        data = T1_swls)
+```
+
+
+
+### 1.1. Configural
+
+Create the model
+
+```{r, message=FALSE}
+T1_mod1 = as.character(measEq.syntax(T1_mod,
+                                data = T1_swls,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "configural")) 
+#cat(as.character(T1_mod1))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T1_fit1 = cfa(T1_mod1,
+              data = T1_swls,
+              ordered = T,
+              group = "Race")
+#summary(T1_fit1, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T1_fit1, fit.measures = names_fit)
+```
+
+#### Modified configural
+
+Check parameters which could improve model fit
+
+
+```{r}
+modindices(T1_fit1, sort. = TRUE, maximum.number = 5)
+```
+
+The residual covariance between Imprt and LiveOver shows the highest modification index (`SWLSImprt.1	~~	SWLSLiveOver.1`), thus, it is added to the baseline model
+
+```{r}
+T1_modB = 'Satisfaction =~ SWLSIdeal.1 + SWLSCond.1 + SWLSSAt.1
+                        + SWLSImprt.1 + SWLSLiveOver.1
+          SWLSImprt.1	~~	SWLSLiveOver.1'
+
+```
+
+Create the model
+
+```{r, message=FALSE}
+T1_mod1B = as.character(measEq.syntax(T1_modB,
+                                data = T1_swls,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "configural")) 
+#cat(as.character(T1_mod1B))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T1_fit1B = cfa(T1_mod1B,
+              data = T1_swls,
+              ordered = T,
+              group = "Race")
+#summary(T1_fit1B, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T1_fit1B, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(T1_fit1, T1_fit1B)
+```
+
+### 1.2. Thresholds
+
+Create the model
+
+```{r, message=FALSE}
+T1_mod2 = as.character(measEq.syntax(T1_modB,
+                                data = T1_swls,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "thresholds")) 
+#cat(as.character(T1_mod2))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T1_fit2 = cfa(T1_mod2,
+              data = T1_swls,
+              ordered = T,
+              group = "Race")
+#summary(T1_fit2, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T1_fit2, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(T1_fit1B, T1_fit2)
+```
+
+### 1.3. Loadings
+
+Create the model
+
+```{r, message=FALSE}
+T1_mod3 = as.character(measEq.syntax(T1_modB,
+                                data = T1_swls,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = c("thresholds", "loadings"))) 
+#cat(as.character(T1_mod3))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T1_fit3 = cfa(T1_mod3,
+              data = T1_swls,
+              ordered = T,
+              group = "Race")
+#summary(T1_fit3, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T1_fit3, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(T1_fit2, T1_fit3)
+```
+
+### Full comparison
+
+Fit indices
+
+```{r}
+MI_T1 <- rbind(
+  configuralA = fitmeasures(T1_fit1, fit.measures = names_fit),
+  configuralB = fitmeasures(T1_fit1B, fit.measures = names_fit),
+  threshold  = fitmeasures(T1_fit2, fit.measures = names_fit),
+  loading  = fitmeasures(T1_fit3, fit.measures = names_fit))
+
+MI_T1 <- MI_T1 %>%
+  cbind(., chisq_df = .[, "chisq.scaled"] / .[, "df.scaled"]) %>%
+  .[, c("chisq.scaled", "df.scaled", "chisq_df", "cfi.scaled", "rmsea.scaled",
+        "rmsea.ci.lower.scaled", "rmsea.ci.upper.scaled", "srmr")]
+
+MI_T1 = round(MI_T1, 3)
+colnames(MI_T1) = names_short
+```
+
+Differences in fit indices
+
+```{r}
+diff_T1 <- rbind(
+  conf_conf = fit_diff(T1_fit1, T1_fit1B),
+  conf_thres = fit_diff(T1_fit1B, T1_fit2),
+  thres_load = fit_diff(T1_fit2, T1_fit3))
+```
+
+**All results**
+
+```{r}
+T1_results = list(MI = MI_T1,
+                  diff = diff_T1)
+
+round(T1_results$MI,3)
+print(round(T1_results$diff,4))
+```
+### Model parameters
+
+Factor loadings (=~)
+
+```{r}
+T1_load = standardizedSolution(T1_fit3) %>%
+  mutate(group = lavInspect(T1_fit3, "group.label")[group]) %>%
+  filter(op == "=~") %>%
+  select(group, lhs, op, rhs, est.std, pvalue)
+```
+
+**Remove objects**
+
+```{r}
+rm(T1_swls, T1_mod, T1_modB, T1_swlsINCL)
+rm(T1_mod1, T1_mod1B, T1_mod2, T1_mod3,
+   T1_fit1, T1_fit1B, T1_fit2, T1_fit3)
+rm(MI_T1, diff_T1)
+```
+
+## 2. Two years after TBI
+
+### Pre-analysis
+
+**Included vs excluded**
+
+```{r}
+T2_swlsINCL = swls %>%
+  mutate(status = ifelse(if_all(matches("SWLS.*\\.2$"), ~ !is.na(.)), 1, 0)) %>%
+  mutate(status = factor(status, labels = c("excluded", "included")))
+
+rbind(freq = table(T2_swlsINCL$status, useNA="ifany"),
+      pct = round(prop.table(table(T2_swlsINCL$status, useNA="ifany"))*100,2))
+```
+
+Descriptive statistics
+
+```{r}
+table1( ~ Sex + Age + Race + Mar + EduYears +
+          Cause + GCSTot + CTComp | status,
+        data = T2_swlsINCL)
+```
+
+Differences per variable
+
+```{r}
+T2diff = compare_vars(T2_swlsINCL, c("Sex", "Age", "Race", "Mar", "EduYears",
+                 "Cause", "GCSTot", "CTComp"), "status")
+
+T2diff %>%
+  mutate(across(c(stat, size), \(x) round(x, 4)))
+```
+
+**Selected sample**
+
+Create the sub-dataset
+
+```{r}
+T2_swls <- swls %>%
+  filter(Race %in% c("White", "Black", "Hispanic Orgin"),
+         if_all(matches("SWLS.*\\.2$"), ~ !is.na(.)) ) %>%
+  select(1:9,
+         matches("SWLS.*\\.2$"))
+nrow(T2_swls)
+```
+
+Create the model
+
+```{r}
+T2_mod = 'Satisfaction =~ SWLSIdeal.2 + SWLSCond.2 + SWLSSAt.2
+                        + SWLSImprt.2 + SWLSLiveOver.2'
+```
+
+Descriptive statistics 
+
+```{r}
+T2desc = table1( ~ Sex + Age + Race + Mar + EduYears +
+          Cause + GCSTot + CTComp,
+        data = T2_swls)
+```
+
+### 2.1. Configural
+
+Create the model
+
+```{r, message=FALSE}
+T2_mod1 = as.character(measEq.syntax(T2_mod,
+                                data = T2_swls,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "configural")) 
+#cat(as.character(T2_mod1))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T2_fit1 = cfa(T2_mod1,
+              data = T2_swls,
+              ordered = T,
+              group = "Race")
+#summary(T2_fit1, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T2_fit1, fit.measures = names_fit)
+```
+#### Modified configural
+
+Check parameters which could improve model fit
+
+
+```{r}
+modindices(T2_fit1, sort. = TRUE, maximum.number = 5)
+```
+
+The residual covariance between Imprt and LiveOver shows the highest modification index (`SWLSImprt.2	~~	SWLSLiveOver.2`), thus, it is added to the baseline model
+
+```{r}
+T2_modB = 'Satisfaction =~ SWLSIdeal.2 + SWLSCond.2 + SWLSSAt.2
+                        + SWLSImprt.2 + SWLSLiveOver.2
+          SWLSImprt.2	~~	SWLSLiveOver.2'
+
+```
+
+Create the model
+
+```{r, message=FALSE}
+T2_mod1B = as.character(measEq.syntax(T2_modB,
+                                data = T2_swls,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "configural")) 
+#cat(as.character(T2_mod1B))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T2_fit1B = cfa(T2_mod1B,
+              data = T2_swls,
+              ordered = T,
+              group = "Race")
+#summary(T2_fit1B, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T2_fit1B, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(T2_fit1, T2_fit1B)
+```
+
+
+### 2.2. Thresholds
+
+Create the model
+
+```{r, message=FALSE}
+T2_mod2 = as.character(measEq.syntax(T2_modB,
+                                data = T2_swls,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "thresholds")) 
+#cat(as.character(T2_mod2))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T2_fit2 = cfa(T2_mod2,
+              data = T2_swls,
+              ordered = T,
+              group = "Race")
+#summary(T2_fit2, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T2_fit2, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(T2_fit1B, T2_fit2)
+```
+
+### 2.3. Loadings
+
+Create the model
+
+```{r, message=FALSE}
+T2_mod3 = as.character(measEq.syntax(T2_modB,
+                                data = T2_swls,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = c("thresholds", "loadings"))) 
+#cat(as.character(T2_mod3))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T2_fit3 = cfa(T2_mod3,
+              data = T2_swls,
+              ordered = T,
+              group = "Race")
+#summary(T2_fit3, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T2_fit3, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(T2_fit2, T2_fit3)
+```
+
+### Full comparison
+
+Fit indices
+
+```{r}
+MI_T2 <- rbind(
+  configuralA = fitmeasures(T2_fit1, fit.measures = names_fit),
+  configuralB = fitmeasures(T2_fit1B, fit.measures = names_fit),
+  threshold  = fitmeasures(T2_fit2, fit.measures = names_fit),
+  loading  = fitmeasures(T2_fit3, fit.measures = names_fit))
+
+MI_T2 <- MI_T2 %>%
+  cbind(., chisq_df = .[, "chisq.scaled"] / .[, "df.scaled"]) %>%
+  .[, c("chisq.scaled", "df.scaled", "chisq_df", "cfi.scaled", "rmsea.scaled",
+        "rmsea.ci.lower.scaled", "rmsea.ci.upper.scaled", "srmr")]
+
+MI_T2 = round(MI_T2, 3)
+colnames(MI_T2) = names_short
+```
+
+Differences in fit indices
+
+```{r}
+diff_T2 <- rbind(
+  conf_conf = fit_diff(T2_fit1, T2_fit1B),
+  conf_thres = fit_diff(T2_fit1B, T2_fit2),
+  thres_load = fit_diff(T2_fit2, T2_fit3))
+```
+
+**All results**
+
+```{r}
+T2_results = list(MI = MI_T2,
+                  diff = diff_T2)
+
+round(T2_results$MI,3)
+print(round(T2_results$diff,4))
+```
+
+### Model parameters
+
+Factor loadings (=~)
+
+```{r}
+T2_load = standardizedSolution(T2_fit3) %>%
+  mutate(group = lavInspect(T2_fit3, "group.label")[group]) %>%
+  filter(op == "=~") %>%
+  select(lhs, op, rhs, est.std, pvalue)
+```
+
+**Remove objects**
+
+```{r}
+rm(T2_swls, T2_mod, T2_modB, T2_swlsINCL)
+rm(T2_mod1, T2_mod1B, T2_mod2, T2_mod3,
+   T2_fit1, T2_fit1B, T2_fit2, T2_fit3)
+rm(MI_T2, diff_T2)
+```
+
+## 3. Five years after TBI
+
+### Pre-analysis
+
+**Included vs excluded**
+
+```{r}
+T3_swlsINCL = swls %>%
+  mutate(status = ifelse(if_all(matches("SWLS.*\\.3$"), ~ !is.na(.)), 1, 0)) %>%
+  mutate(status = factor(status, labels = c("excluded", "included")))
+
+rbind(freq = table(T3_swlsINCL$status, useNA="ifany"),
+      pct = round(prop.table(table(T3_swlsINCL$status, useNA="ifany"))*100,2))
+```
+
+Descriptive statistics
+
+```{r}
+table1( ~ Sex + Age + Race + Mar + EduYears +
+          Cause + GCSTot + CTComp | status,
+        data = T3_swlsINCL)
+```
+
+Differences per variable
+
+```{r}
+T3diff = compare_vars(T3_swlsINCL, c("Sex", "Age", "Race", "Mar", "EduYears",
+                 "Cause", "GCSTot", "CTComp"), "status")
+
+T3diff %>%
+  mutate(across(c(stat, size), \(x) round(x, 4)))
+```
+
+**Selected sample**
+
+Create the sub-dataset
+
+```{r}
+T3_swls <- swls %>%
+  filter(Race %in% c("White", "Black", "Hispanic Orgin"),
+         if_all(matches("SWLS.*\\.3$"), ~ !is.na(.)) ) %>%
+  select(1:9,
+         matches("SWLS.*\\.3$"))
+nrow(T3_swls)
+```
+
+Create the model
+
+```{r}
+T3_mod = 'Satisfaction =~ SWLSIdeal.3 + SWLSCond.3 + SWLSSAt.3
+                        + SWLSImprt.3 + SWLSLiveOver.3'
+```
+
+Descriptive statistics 
+
+```{r}
+T3desc = table1( ~ Sex + Age + Race + Mar + EduYears +
+          Cause + GCSTot + CTComp,
+        data = T3_swls)
+```
+
+### 3.1. Configural
+
+Create the model
+
+```{r, message=FALSE}
+T3_mod1 = as.character(measEq.syntax(T3_mod,
+                                data = T3_swls,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "configural")) 
+#cat(as.character(T3_mod1))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T3_fit1 = cfa(T3_mod1,
+              data = T3_swls,
+              ordered = T,
+              group = "Race")
+#summary(T3_fit1, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T3_fit1, fit.measures = names_fit)
+```
+
+#### Modified configural
+
+Check parameters which could improve model fit
+
+
+```{r}
+modindices(T3_fit1, sort. = TRUE, maximum.number = 5)
+```
+
+The residual covariance between Imprt and LiveOver shows the highest modification index (`SWLSImprt.3	~~	SWLSLiveOver.3`), thus, it is added to the baseline model
+
+```{r}
+T3_modB = 'Satisfaction =~ SWLSIdeal.3 + SWLSCond.3 + SWLSSAt.3
+                        + SWLSImprt.3 + SWLSLiveOver.3
+          SWLSImprt.3	~~	SWLSLiveOver.3'
+
+```
+
+Create the model
+
+```{r, message=FALSE}
+T3_mod1B = as.character(measEq.syntax(T3_modB,
+                                data = T3_swls,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "configural")) 
+#cat(as.character(T3_mod1B))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T3_fit1B = cfa(T3_mod1B,
+              data = T3_swls,
+              ordered = T,
+              group = "Race")
+#summary(T3_fit1B, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T3_fit1B, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(T3_fit1, T3_fit1B)
+```
+
+### 3.2. Thresholds
+
+Create the model
+
+```{r, message=FALSE}
+T3_mod2 = as.character(measEq.syntax(T3_modB,
+                                data = T3_swls,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "thresholds")) 
+#cat(as.character(T3_mod2))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T3_fit2 = cfa(T3_mod2,
+              data = T3_swls,
+              ordered = T,
+              group = "Race")
+#summary(T3_fit2, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T3_fit2, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(T3_fit1B, T3_fit2)
+```
+
+### 3.3. Loadings
+
+Create the model
+
+```{r, message=FALSE}
+T3_mod3 = as.character(measEq.syntax(T3_modB,
+                                data = T3_swls,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = c("thresholds", "loadings"))) 
+#cat(as.character(T3_mod3))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T3_fit3 = cfa(T3_mod3,
+              data = T3_swls,
+              ordered = T,
+              group = "Race")
+#summary(T3_fit3, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T3_fit3, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(T3_fit2, T3_fit3)
+```
+
+### Full comparison
+
+Fit indices
+
+```{r}
+MI_T3 <- rbind(
+  configuralA = fitmeasures(T3_fit1, fit.measures = names_fit),
+  configuralB = fitmeasures(T3_fit1B, fit.measures = names_fit),
+  threshold  = fitmeasures(T3_fit2, fit.measures = names_fit),
+  loading  = fitmeasures(T3_fit3, fit.measures = names_fit))
+
+MI_T3 <- MI_T3 %>%
+  cbind(., chisq_df = .[, "chisq.scaled"] / .[, "df.scaled"]) %>%
+  .[, c("chisq.scaled", "df.scaled", "chisq_df", "cfi.scaled", "rmsea.scaled",
+        "rmsea.ci.lower.scaled", "rmsea.ci.upper.scaled", "srmr")]
+
+MI_T3 = round(MI_T3, 3)
+colnames(MI_T3) = names_short
+```
+
+Differences in fit indices
+
+```{r}
+diff_T3 <- rbind(
+  conf_conf = fit_diff(T3_fit1, T3_fit1B),
+  conf_thres = fit_diff(T3_fit1B, T3_fit2),
+  thres_load = fit_diff(T3_fit2, T3_fit3))
+```
+
+**All results**
+
+```{r}
+T3_results = list(MI = MI_T3,
+                  diff = diff_T3)
+
+round(T3_results$MI,3)
+print(round(T3_results$diff,4))
+```
+
+### Model parameters
+
+Factor loadings (=~)
+
+```{r}
+T3_load = standardizedSolution(T3_fit3) %>%
+  mutate(group = lavInspect(T3_fit3, "group.label")[group]) %>%
+  filter(op == "=~") %>%
+  select(lhs, op, rhs, est.std, pvalue)
+```
+
+**Remove objects**
+
+```{r}
+rm(T3_swls, T3_mod, T3_modB, T3_swlsINCL)
+rm(T3_mod1, T3_mod1B, T3_mod2, T3_mod3,
+   T3_fit1, T3_fit1B, T3_fit2, T3_fit3)
+rm(MI_T3, diff_T3)
+```
+
+## Export results
+
+Descriptive statistics
+
+```{r, eval=FALSE}
+writeLines(paste(
+    "<h2>Timepoint 1</h2>",
+    as.character(T1desc),
+    "<h2>Timepoint 2</h2>",
+    as.character(T2desc),
+    "<h2>Timepoint 3</h2>",
+    as.character(T3desc)),
+  "data/descriptives_CrossMI.html")
+```
+
+Differences included-excluded
+
+```{r, eval=FALSE}
+write_xlsx(list(T1 = T1diff,
+                T2 = T2diff,
+                T3 = T3diff),
+           "data/comparison_Cross_IncExc.xlsx")
+```
+
+Proportions
+
+```{r, eval=FALSE}
+write_xlsx(proportions, "data/proportiontables.xlsx")
+```
+
+Fit indices
+
+```{r, eval=FALSE}
+toexcel <- \(x) data.frame(model = rownames(x), x, check.names = FALSE)
+
+write_xlsx(list(
+  T1_MI   = toexcel(T1_results$MI),
+  T1_diff = toexcel(T1_results$diff),
+  T2_MI   = toexcel(T2_results$MI),
+  T2_diff = toexcel(T2_results$diff),
+  T3_MI   = toexcel(T3_results$MI),
+  T3_diff = toexcel(T3_results$diff)),
+  "data/results_CrossMI.xlsx")
+
+rm(toexcel)
+```
+
+**Remove objects**
+```{r}
+rm(T1desc, T2desc, T3desc,
+   T1diff, T2diff, T3diff,
+   proportions)
+```
+
+
+# III. Longitudinal MI (full-sample)
+
+## Pre-analysis
+
+**Included vs excluded**
+
+```{r}
+long_swlsINCL = swls %>%
+  mutate(status = ifelse(if_all(matches("SWLS.*\\.(1|2|3)$"), ~ !is.na(.)), 1, 0)) %>%
+  mutate(status = factor(status, labels = c("excluded", "included")))
+
+rbind(freq = table(long_swlsINCL$status, useNA="ifany"),
+      pct = round(prop.table(table(long_swlsINCL$status, useNA="ifany"))*100,2))
+```
+Descriptive statistics
+
+```{r}
+table1( ~ Sex + Age + Race + Mar + EduYears +
+          Cause + GCSTot + CTComp | status,
+        data = long_swlsINCL)
+```
+
+Differences per variable
+
+```{r}
+longdiff = compare_vars(long_swlsINCL, c("Sex", "Age", "Race", "Mar", "EduYears",
+                 "Cause", "GCSTot", "CTComp"), "status")
+
+longdiff %>%
+  mutate(across(c(stat, size), \(x) round(x, 4)))
+```
+
+**Selected sample**
+
+Create the subsample
+
+```{r}
+long_swls <- swls %>%
+  filter(Race %in% c("White", "Black", "Hispanic Orgin"),
+         if_all(matches("SWLS.*\\.(1|2|3)$"), ~ !is.na(.)) ) %>%
+  select(1:9,
+         matches("SWLS.*\\.(1|2|3)$"))
+nrow(long_swls)
+```
+
+Create the model
+
+```{r}
+long_mod = 'Satisfaction.1 =~ SWLSIdeal.1 + SWLSCond.1 + SWLSSAt.1
+                            + SWLSImprt.1 + SWLSLiveOver.1
+            Satisfaction.2 =~ SWLSIdeal.2 + SWLSCond.2 + SWLSSAt.2
+                            + SWLSImprt.2 + SWLSLiveOver.2
+            Satisfaction.3 =~ SWLSIdeal.3 + SWLSCond.3 + SWLSSAt.3
+                            + SWLSImprt.3 + SWLSLiveOver.3'
+```
+
+Create factor correspondence
+
+```{r}
+long_factors = list(Satisfaction = c("Satisfaction.1", "Satisfaction.2",
+                                     "Satisfaction.3"))
+```
+
+Descriptive statistics 
+
+```{r}
+longdesc = table1( ~ Sex + Age + Race + Mar + EduYears +
+          Cause + GCSTot + CTComp,
+        data = long_swls)
+```
+
+## 1. Configural
+
+Create the model
+
+```{r, message=FALSE}
+long_mod1 = as.character(measEq.syntax(long_mod,
+                                data = long_swls,     
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long_factors,
+                                long.equal = "configural")) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+long_fit1 = cfa(long_mod1,
+             data = long_swls,
+             ordered = T, std.lv = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(long_fit1, fit.measures = names_fit)
+```
+
+### Modified configural
+
+Check parameters which could improve model fit
+
+
+```{r}
+modindices(long_fit1, sort. = TRUE, maximum.number = 5)
+```
+Some residual covariances between Imprt and LiveOver show up with high modification indices. To match the cross-sectional analyses, they're all added to the baseline model.
+
+```{r}
+long_modB = 'Satisfaction.1 =~ SWLSIdeal.1 + SWLSCond.1 + SWLSSAt.1
+                             + SWLSImprt.1 + SWLSLiveOver.1
+                             SWLSImprt.1	~~	SWLSLiveOver.1
+             Satisfaction.2 =~ SWLSIdeal.2 + SWLSCond.2 + SWLSSAt.2
+                             + SWLSImprt.2 + SWLSLiveOver.2
+                             SWLSImprt.2	~~	SWLSLiveOver.2
+             Satisfaction.3 =~ SWLSIdeal.3 + SWLSCond.3 + SWLSSAt.3
+                             + SWLSImprt.3 + SWLSLiveOver.3
+                             SWLSImprt.3	~~	SWLSLiveOver.3'
+```
+
+Create the model
+
+```{r, message=FALSE}
+long_mod1B = as.character(measEq.syntax(long_modB,
+                                data = long_swls,     
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long_factors,
+                                long.equal = "configural")) 
+#cat(as.character(long_mod1B))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+long_fit1B = cfa(long_mod1B,
+             data = long_swls,
+             ordered = T, std.lv = T)
+#summary(long_fit1B, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(long_fit1B, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(long_fit1, long_fit1B)
+```
+
+## 2. Thresholds
+
+Create the model
+
+```{r, message=FALSE}
+long_mod2 = as.character(measEq.syntax(long_modB,
+                                data = long_swls,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long_factors,
+                                long.equal = "thresholds")) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+long_fit2 = cfa(long_mod2,
+             data = long_swls,
+             ordered = T, std.lv = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(long_fit2, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(long_fit1B, long_fit2)
+```
+
+## 3. Loadings
+
+Create the model
+
+```{r, message=FALSE}
+long_mod3 = as.character(measEq.syntax(long_modB,
+                                data = long_swls,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long_factors,
+                                long.equal = c("thresholds", "loadings"))) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+long_fit3 = cfa(long_mod3,
+             data = long_swls,
+             ordered = T, std.lv = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(long_fit3, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(long_fit2, long_fit3)
+```
+
+## Full comparison
+
+Fit indices
+
+```{r}
+MI_long <- rbind(
+  configuralA = fitmeasures(long_fit1, fit.measures = names_fit),
+  configuralB = fitmeasures(long_fit1B, fit.measures = names_fit),
+  threshold  = fitmeasures(long_fit2, fit.measures = names_fit),
+  loading    = fitmeasures(long_fit3, fit.measures = names_fit))
+
+MI_long <- MI_long %>%
+  cbind(., chisq_df = .[, "chisq.scaled"] / .[, "df.scaled"]) %>%
+  .[, c("chisq.scaled", "df.scaled", "chisq_df", "cfi.scaled", "rmsea.scaled",
+        "rmsea.ci.lower.scaled", "rmsea.ci.upper.scaled", "srmr")]
+
+MI_long = round(MI_long, 3)
+colnames(MI_long) = names_short
+```
+
+Differences in fit indices
+
+```{r}
+diff_long <- rbind(
+  conf_conf = fit_diff(long_fit1, long_fit1B),
+  conf_thres = fit_diff(long_fit1B, long_fit2),
+  thres_load = fit_diff(long_fit2, long_fit3))
+```
+
+**All results**
+
+```{r}
+long_results = list(MI = MI_long,
+                    diff = diff_long)
+
+round(long_results$MI,3)
+print(round(long_results$diff,4))
+```
+## Model parameters
+
+Factor loadings (=~)
+
+```{r}
+long_load = standardizedSolution(long_fit3) %>%
+  filter(op == "=~") %>%
+  select(lhs, op, rhs, est.std, pvalue)
+```
+
+## Remove objects
+
+```{r, eval=TRUE}
+rm(long_swls, long_swlsINCL)
+rm(long_mod1, long_mod1B, long_mod2, long_mod3)
+rm(long_fit1, long_fit1B, long_fit2, long_fit3)
+rm(MI_long, diff_long)
+```
+
+
+# IV. Sensitivity analysis (per group longitudinal MI)
+
+### 1. White patients
+
+Create the sub-dataset
+
+```{r}
+W_swls <- swls %>%
+  filter(Race %in% c("White"),
+         if_all(matches("SWLS.*\\.(1|2|3)$"), ~ !is.na(.)) ) %>%
+  select(1:9,
+         matches("SWLS.*\\.(1|2|3)$"))
+nrow(W_swls)
+```
+
+Descriptive statistics 
+
+```{r}
+Wdesc = table1( ~ Sex + Age + Race + Mar + EduYears +
+          Cause + GCSTot + CTComp,
+        data = W_swls)
+```
+
+#### Sample information
+
+**Comparison between included and excluded**
+
+```{r}
+W_swlsINCL = swls %>%
+  mutate(status = ifelse(if_all(matches("SWLS.*\\.(1|2|3)$"), ~ !is.na(.))
+                         & Race == "White", 1, 0)) %>%
+  mutate(status = factor(status, labels = c("excluded", "included")))
+
+rbind(freq = table(W_swlsINCL$status, useNA="ifany"),
+      pct = round(prop.table(table(W_swlsINCL$status, useNA="ifany"))*100,2))
+```
+**Descriptive statistics**
+
+```{r}
+table1( ~ Sex + Age + Race + Mar + EduYears +
+          Cause + GCSTot + CTComp | status,
+        data = W_swlsINCL)
+```
+
+**Differences per variable**
+
+```{r}
+Wdiff = compare_vars(W_swlsINCL, c("Sex", "Age", "Mar", "EduYears",
+                 "Cause", "GCSTot", "CTComp"), "status")
+
+Wdiff %>%
+  mutate(across(c(stat, size), \(x) round(x, 4)))
+```
+
+#### 1.1. Configural
+
+Create the model
+
+```{r, message=FALSE}
+W_mod1 = as.character(measEq.syntax(long_modB,
+                                data = W_swls,     
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long_factors,
+                                long.equal = "configural")) 
+#cat(as.character(W_mod1))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+W_fit1 = cfa(W_mod1,
+             data = W_swls,
+             ordered = T, std.lv = T)
+#summary(W_fit1, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(W_fit1, fit.measures = names_fit)
+```
+
+#### 1.2. Thresholds
+
+Create the model
+
+```{r, message=FALSE}
+W_mod2 = as.character(measEq.syntax(long_modB,
+                                data = W_swls,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long_factors,
+                                long.equal = "thresholds")) 
+#cat(as.character(W_mod2))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+W_fit2 = cfa(W_mod2,
+             data = W_swls,
+             ordered = T, std.lv = T)
+#summary(W_fit2, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(W_fit2, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(W_fit1, W_fit2)
+```
+
+#### 1.3. Loadings
+
+Create the model
+
+```{r, message=FALSE}
+W_mod3 = as.character(measEq.syntax(long_modB,
+                                data = W_swls,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long_factors,
+                                long.equal = c("thresholds", "loadings"))) 
+#cat(as.character(W_mod3))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+W_fit3 = cfa(W_mod3,
+             data = W_swls,
+             ordered = T, std.lv = T)
+#summary(W_fit3, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(W_fit3, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(W_fit2, W_fit3)
+```
+
+#### Full comparison
+
+Fit indices
+
+```{r}
+MI_W <- rbind(
+  configuralB = fitmeasures(W_fit1, fit.measures = names_fit),
+  threshold  = fitmeasures(W_fit2, fit.measures = names_fit),
+  loading  = fitmeasures(W_fit3, fit.measures = names_fit))
+
+MI_W <- MI_W %>%
+  cbind(., chisq_df = .[, "chisq.scaled"] / .[, "df.scaled"]) %>%
+  .[, c("chisq.scaled", "df.scaled", "chisq_df", "cfi.scaled", "rmsea.scaled",
+        "rmsea.ci.lower.scaled", "rmsea.ci.upper.scaled", "srmr")]
+
+MI_W = round(MI_W, 3)
+colnames(MI_W) = names_short
+```
+
+Differences in fit indices
+
+```{r}
+diff_W <- rbind(
+  conf_thres = fit_diff(W_fit1, W_fit2),
+  thres_load = fit_diff(W_fit2, W_fit3))
+```
+
+**All results**
+
+```{r}
+W_results = list(MI = MI_W,
+                  diff = diff_W)
+
+round(W_results$MI,3)
+print(round(W_results$diff,4))
+```
+
+#### Remove objects
+
+```{r}
+rm(W_swls, W_swlsINCL)
+rm(W_mod1, W_mod2, W_mod3,
+   W_fit1, W_fit2, W_fit3)
+rm(MI_W, diff_W)
+```
+
+### 2. Black patients
+
+Create the sub-dataset
+
+```{r}
+B_swls <- swls %>%
+  filter(Race %in% c("Black"),
+         if_all(matches("SWLS.*\\.(1|2|3)$"), ~ !is.na(.)) ) %>%
+  select(1:9,
+         matches("SWLS.*\\.(1|2|3)$"))
+nrow(B_swls)
+```
+
+Descriptive statistics 
+
+```{r}
+Bdesc = table1( ~ Sex + Age + Race + Mar + EduYears +
+          Cause + GCSTot + CTComp,
+        data = B_swls)
+```
+
+#### Sample information
+
+**Comparison between included and excluded**
+
+```{r}
+B_swlsINCL = swls %>%
+  mutate(status = ifelse(if_all(matches("SWLS.*\\.(1|2|3)$"), ~ !is.na(.))
+                         & Race == "Black", 1, 0)) %>%
+  mutate(status = factor(status, labels = c("excluded", "included")))
+
+rbind(freq = table(B_swlsINCL$status, useNA="ifany"),
+      pct = round(prop.table(table(B_swlsINCL$status, useNA="ifany"))*100,2))
+```
+**Descriptive statistics**
+
+```{r}
+table1( ~ Sex + Age + Race + Mar + EduYears +
+          Cause + GCSTot + CTComp | status,
+        data = B_swlsINCL)
+```
+
+**Differences per variable**
+
+```{r}
+Bdiff = compare_vars(B_swlsINCL, c("Sex", "Age", "Mar", "EduYears",
+                 "Cause", "GCSTot", "CTComp"), "status")
+
+Bdiff %>%
+  mutate(across(c(stat, size), \(x) round(x, 4)))
+```
+
+#### 2.1. Configural
+
+Create the model
+
+```{r, message=FALSE}
+B_mod1 = as.character(measEq.syntax(long_modB,
+                                data = B_swls,     
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long_factors,
+                                long.equal = "configural")) 
+#cat(as.character(B_mod1))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+B_fit1 = cfa(B_mod1,
+             data = B_swls,
+             ordered = T, std.lv = T)
+#summary(B_fit1, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(B_fit1, fit.measures = names_fit)
+```
+
+#### 2.2. Thresholds
+
+Create the model
+
+```{r, message=FALSE}
+B_mod2 = as.character(measEq.syntax(long_modB,
+                                data = B_swls,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long_factors,
+                                long.equal = "thresholds")) 
+#cat(as.character(B_mod2))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+B_fit2 = cfa(B_mod2,
+             data = B_swls,
+             ordered = T, std.lv = T)
+#summary(B_fit2, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(B_fit2, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(B_fit1, B_fit2)
+```
+
+#### 2.3. Loadings
+
+Create the model
+
+```{r, message=FALSE}
+B_mod3 = as.character(measEq.syntax(long_modB,
+                                data = B_swls,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long_factors,
+                                long.equal = c("thresholds", "loadings"))) 
+#cat(as.character(B_mod3))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+B_fit3 = cfa(B_mod3,
+             data = B_swls,
+             ordered = T, std.lv = T)
+#summary(B_fit3, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(B_fit3, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(B_fit2, B_fit3)
+```
+
+#### Full comparison
+
+Fit indices
+
+```{r}
+MI_B <- rbind(
+  configuralB = fitmeasures(B_fit1, fit.measures = names_fit),
+  threshold  = fitmeasures(B_fit2, fit.measures = names_fit),
+  loading  = fitmeasures(B_fit3, fit.measures = names_fit))
+
+MI_B <- MI_B %>%
+  cbind(., chisq_df = .[, "chisq.scaled"] / .[, "df.scaled"]) %>%
+  .[, c("chisq.scaled", "df.scaled", "chisq_df", "cfi.scaled", "rmsea.scaled",
+        "rmsea.ci.lower.scaled", "rmsea.ci.upper.scaled", "srmr")]
+
+MI_B = round(MI_B, 3)
+colnames(MI_B) = names_short
+```
+
+Differences in fit indices
+
+```{r}
+diff_B <- rbind(
+  conf_thres = fit_diff(B_fit1, B_fit2),
+  thres_load = fit_diff(B_fit2, B_fit3))
+```
+
+**All results**
+
+```{r}
+B_results = list(MI = MI_B,
+                  diff = diff_B)
+
+round(B_results$MI,3)
+print(round(B_results$diff,4))
+```
+
+#### Remove objects
+
+```{r}
+rm(B_swls, B_swlsINCL)
+rm(B_mod1, B_mod2, B_mod3,
+   B_fit1, B_fit2, B_fit3)
+rm(MI_B, diff_B)
+```
+
+
+### 3. Hispanic patients
+
+Create the sub-dataset
+
+```{r}
+H_swls <- swls %>%
+  filter(Race %in% c("Hispanic Orgin"),
+         if_all(matches("SWLS.*\\.(1|2|3)$"), ~ !is.na(.)) ) %>%
+  select(1:9,
+         matches("SWLS.*\\.(1|2|3)$"))
+nrow(H_swls)
+```
+
+Descriptive statistics 
+
+```{r}
+Hdesc = table1( ~ Sex + Age + Race + Mar + EduYears +
+          Cause + GCSTot + CTComp,
+        data = H_swls)
+```
+
+#### Sample information
+
+**Comparison between included and excluded**
+
+```{r}
+H_swlsINCL = swls %>%
+  mutate(status = ifelse(if_all(matches("SWLS.*\\.(1|2|3)$"), ~ !is.na(.))
+                         & Race == "Hispanic Orgin", 1, 0)) %>%
+  mutate(status = factor(status, labels = c("excluded", "included")))
+
+rbind(freq = table(H_swlsINCL$status, useNA="ifany"),
+      pct = round(prop.table(table(H_swlsINCL$status, useNA="ifany"))*100,2))
+```
+**Descriptive statistics**
+
+```{r}
+table1( ~ Sex + Age + Race + Mar + EduYears +
+          Cause + GCSTot + CTComp | status,
+        data = H_swlsINCL)
+```
+
+**Differences per variable**
+
+```{r}
+Hdiff = compare_vars(H_swlsINCL, c("Sex", "Age", "Mar", "EduYears",
+                 "Cause", "GCSTot", "CTComp"), "status")
+
+Hdiff %>%
+  mutate(across(c(stat, size), \(x) round(x, 4)))
+```
+
+#### 3.1. Configural
+
+Create the model
+
+```{r, message=FALSE}
+H_mod1 = as.character(measEq.syntax(long_modB,
+                                data = H_swls,     
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long_factors,
+                                long.equal = "configural")) 
+#cat(as.character(H_mod1))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+H_fit1 = cfa(H_mod1,
+             data = H_swls,
+             ordered = T, std.lv = T)
+#summary(H_fit1, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(H_fit1, fit.measures = names_fit)
+```
+
+#### 3.2. Thresholds
+
+Create the model
+
+```{r, message=FALSE}
+H_mod2 = as.character(measEq.syntax(long_modB,
+                                data = H_swls,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long_factors,
+                                long.equal = "thresholds")) 
+#cat(as.character(H_mod2))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+H_fit2 = cfa(H_mod2,
+             data = H_swls,
+             ordered = T, std.lv = T)
+#summary(H_fit2, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(H_fit2, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(H_fit1, H_fit2)
+```
+
+#### 3.3. Loadings
+
+Create the model
+
+```{r, message=FALSE}
+H_mod3 = as.character(measEq.syntax(long_modB,
+                                data = H_swls,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long_factors,
+                                long.equal = c("thresholds", "loadings"))) 
+#cat(as.character(H_mod3))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+H_fit3 = cfa(H_mod3,
+             data = H_swls,
+             ordered = T, std.lv = T)
+#summary(H_fit3, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(H_fit3, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(H_fit2, H_fit3)
+```
+
+#### Full comparison
+
+Fit indices
+
+```{r}
+MI_H <- rbind(
+  configuralB = fitmeasures(H_fit1, fit.measures = names_fit),
+  threshold  = fitmeasures(H_fit2, fit.measures = names_fit),
+  loading  = fitmeasures(H_fit3, fit.measures = names_fit))
+
+MI_H <- MI_H %>%
+  cbind(., chisq_df = .[, "chisq.scaled"] / .[, "df.scaled"]) %>%
+  .[, c("chisq.scaled", "df.scaled", "chisq_df", "cfi.scaled", "rmsea.scaled",
+        "rmsea.ci.lower.scaled", "rmsea.ci.upper.scaled", "srmr")]
+
+MI_H = round(MI_H, 3)
+colnames(MI_H) = names_short
+```
+
+Differences in fit indices
+
+```{r}
+diff_H <- rbind(
+  conf_thres = fit_diff(H_fit1, H_fit2),
+  thres_load = fit_diff(H_fit2, H_fit3))
+```
+
+**All results**
+
+```{r}
+H_results = list(MI = MI_H,
+                  diff = diff_H)
+
+round(H_results$MI,3)
+print(round(H_results$diff,4))
+```
+
+#### Remove objects
+
+```{r}
+rm(H_swls, H_swlsINCL)
+rm(H_mod1, H_mod2, H_mod3,
+   H_fit1, H_fit2, H_fit3)
+rm(MI_H, diff_H)
+```
+
+```{r}
+rm(long_mod, long_modB, long_factors)
+```
+
+
+## Export results
+
+Descriptive statistics
+
+```{r, eval=FALSE}
+writeLines(paste(
+    "<h2>Full sample</h2>",
+    as.character(longdesc),
+    "<h2>White participants</h2>",
+    as.character(Wdesc),
+    "<h2>Black participants</h2>",
+    as.character(Bdesc),
+    "<h2>Hispanic participants</h2>",
+    as.character(Hdesc)),
+  "data/descriptives_LongMI.html")
+```
+
+Differences included-excluded
+
+```{r, eval=FALSE}
+write_xlsx(list(full = longdiff,
+                W = Wdiff,
+                B = Bdiff,
+                H = Hdiff),
+           "data/comparison_Long_IncExc.xlsx")
+```
+
+Standardized loadings
+
+```{r, eval=FALSE}
+write_xlsx(list(T1 = T1_load,
+                T2 = T2_load,
+                T3 = T3_load,
+                long = long_load),
+           "data/loadings.xlsx")
+```
+
+
+Fit indices
+
+```{r, eval=FALSE}
+toexcel <- \(x) data.frame(model = rownames(x), x, check.names = FALSE)
+
+write_xlsx(list(
+  full_MI   = toexcel(long_results$MI),
+  full_diff = toexcel(long_results$diff),
+  W_MI   = toexcel(W_results$MI),
+  W_diff = toexcel(W_results$diff),
+  B_MI   = toexcel(B_results$MI),
+  B_diff = toexcel(B_results$diff),
+  H_MI   = toexcel(H_results$MI),
+  H_diff = toexcel(H_results$diff)),
+  "data/results_LongMI.xlsx")
+
+rm(toexcel)
+```
+
+**Remove objects**
+```{r}
+rm(longdesc, Wdesc, Bdesc, Hdesc,
+   longdiff, Wdiff, Bdiff, Hdiff)
+```
+
