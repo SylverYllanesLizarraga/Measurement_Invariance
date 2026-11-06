@@ -1,0 +1,1849 @@
+---
+title: "PARTO - Cross-sectional Measurement invariance"
+author: "Sylver Yllanes-Lizarraga"
+
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    self_contained: true
+  pdf_document:
+    toc: true
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Libraries
+
+```{r, message=FALSE, warning=FALSE}
+library(foreign)
+library(haven)
+library(dplyr)
+library(stringr)
+library(table1)
+library(openxlsx)
+library(tidyr)
+library(purrr)
+
+library(lavaan)
+library(EGAnet)
+library(psych)
+library(semTools)
+```
+
+# Auxiliary functions
+
+**Differences in fit**
+
+`fit_diff()`, to summarize the differences between invariance levels
+
+```{r}
+fit_diff <- function(fit1, fit2) {
+  lrt <- lavTestLRT(fit1, fit2)
+  data.frame(D.chisq = round(lrt$`Chisq diff`[2], 2),
+             D.df = lrt$`Df diff`[2],
+             pvalue = signif(lrt$`Pr(>Chisq)`[2], 3),
+             D.cfi = round(unname(fitMeasures(fit2, "cfi.scaled") -
+                                   fitMeasures(fit1, "cfi.scaled")), 3),
+             D.rmsea = round(unname(fitMeasures(fit2, "rmsea.scaled") -
+                                     fitMeasures(fit1, "rmsea.scaled")), 3))}
+```
+
+**Significance of MI violation**
+
+`extract_elements()`, to extract the necessary information for `ThresholdProbability()`
+
+```{r}
+extract_elements = function(fit,
+                            group.id,
+                            factor.names,
+                            item.prefixes,
+                            n.item,
+                            n.threshold) {
+  
+  par.estim = parameterEstimates(fit)
+  
+  # --- Item order from loadings (source of truth) ---
+  item.names = par.estim[par.estim$op == "=~" &
+                         par.estim$group == group.id, "rhs"]
+  
+  # --- Thresholds (NA-padded, ordered to match loadings) ---
+  thres.df  = par.estim[par.estim$op == "|" &
+                        Reduce(`|`, lapply(item.prefixes, function(p) startsWith(par.estim$lhs, p))) &
+                        par.estim$group == group.id, c("lhs", "est")]
+  
+  thres.mat = matrix(NA, nrow = length(item.names), ncol = n.threshold)
+  
+  for (i in seq_along(item.names)) {
+    vals = thres.df$est[thres.df$lhs == item.names[i]]
+    if (length(vals) > 0) thres.mat[i, 1:length(vals)] = vals }
+  
+  # --- Loadings ---
+  loadings = par.estim[par.estim$op == "=~" &
+                       par.estim$group == group.id, "est"]
+  
+  # --- Factor means ---
+  com.factor.mean = par.estim[par.estim$op == "~1" &
+                              par.estim$lhs %in% factor.names &
+                              par.estim$group == group.id, "est"]
+  
+  # --- Factor variances ---
+  com.factor.var = par.estim[par.estim$op == "~~" &
+                             par.estim$lhs %in% factor.names &
+                             par.estim$rhs == par.estim$lhs &
+                             par.estim$group == group.id, "est"]
+  
+  # --- Unique factor variances (ordered to match loadings) ---
+  uni.factor.var = par.estim[par.estim$op == "~~" &
+                             par.estim$rhs == par.estim$lhs &
+                             par.estim$lhs %in% item.names &
+                             par.estim$group == group.id, "est"]
+  
+  # --- Item intercepts (ordered to match loadings) ---
+  item.int = sapply(item.names, function(v)
+    par.estim$est[par.estim$op == "~1" &
+                  par.estim$lhs == v &
+                  par.estim$group == group.id])
+  
+  list(loadings        = loadings,
+       com.factor.mean = com.factor.mean,
+       com.factor.var  = com.factor.var,
+       uni.factor.var  = uni.factor.var,
+       item.int        = item.int,
+       thres.matrix    = thres.mat) }
+```
+
+Modified `ThresholdProbability()`, to calculate the estimated probabilities for choosing each response category for each item (Liu et al., 2017)
+
+```{r}
+ThresholdProbability = function(n.Item,
+                                Loadings,                 # matrix: n.Item x n.Factors
+                                Common.Factor.Mean,       # vector: length n.Factors
+                                Common.Factor.Variance,   # matrix: n.Factors x n.Factors
+                                Unique.Factor.Variances,  # vector: length n.Item
+                                n.Threshold,
+                                Thresholds,               # matrix: n.Item x n.Threshold
+                                Item.Intercepts) {        # vector, length n.Item
+  
+  LAMBDA = as.matrix(Loadings)                   # n.Item x n.Factors
+  KAPPA  = as.matrix(Common.Factor.Mean)         # n.Factors x 1
+  PHI    = as.matrix(Common.Factor.Variance)     # n.Factors x n.Factors
+  THETA  = diag(Unique.Factor.Variances)         # n.Item x n.Item
+  
+  MU    = as.matrix(Item.Intercepts) + LAMBDA %*% KAPPA   # CHANGED (was LAMBDA %*% KAPPA): n.Item x 1
+  SIGMA = LAMBDA %*% PHI %*% t(LAMBDA) + THETA   # n.Item x n.Item
+  
+  Item.SDs = sqrt(diag(SIGMA))
+  
+  p.LE.Threshold      = matrix(NA, nrow = n.Item, ncol = n.Threshold)
+  p.within.Thresholds = matrix(NA, nrow = n.Item, ncol = n.Threshold + 1)
+  
+  for (i in 1:n.Item) {
+    for (j in 1:n.Threshold) {
+      p.LE.Threshold[i, j] = pnorm(Thresholds[i, j], mean = MU[i], sd = Item.SDs[i]) }}
+  
+  for (i in 1:n.Item) {
+    p.within.Thresholds[i, 1] = p.LE.Threshold[i, 1]
+    last.valid = max(which(!is.na(p.LE.Threshold[i, ])))  # handles variable # of thresholds per item
+    
+    if (last.valid < n.Threshold) {
+      # Item has fewer active thresholds than the max
+      p.within.Thresholds[i, last.valid + 1] = 1 - p.LE.Threshold[i, last.valid]
+      if (last.valid > 1) {
+        for (j in 2:last.valid) {
+          p.within.Thresholds[i, j] = p.LE.Threshold[i, j] - p.LE.Threshold[i, j - 1] }}}
+    else {
+      p.within.Thresholds[i, n.Threshold + 1] = 1 - p.LE.Threshold[i, n.Threshold]
+      for (j in 2:n.Threshold) {
+        p.within.Thresholds[i, j] = p.LE.Threshold[i, j] - p.LE.Threshold[i, j - 1] }}}
+  
+  return(p.within.Thresholds)}
+```
+
+`groupProbability`, to call both previous functions more easily
+
+```{r}
+groupProbability = function(fit,
+                            n.groups,
+                            factor.names,
+                            item.prefixes,
+                            n.item,
+                            n.threshold,
+                            group.names = lavInspect(fit, "group.label")) {
+  lapply(1:n.groups, function(group_id) {
+    t = extract_elements(fit           = fit,
+                          group.id      = group_id,
+                          factor.names  = factor.names,
+                          item.prefixes = item.prefixes,
+                          n.item        = n.item,
+                          n.threshold   = n.threshold)
+    
+    ThresholdProbability(n.Item                  = n.item,
+                         Loadings                = matrix(t$loadings, nrow = n.item, ncol = length(factor.names)),
+                         Common.Factor.Mean      = matrix(t$com.factor.mean, ncol = 1),
+                         Common.Factor.Variance  = diag(t$com.factor.var, nrow = length(factor.names)),
+                         Unique.Factor.Variances = t$uni.factor.var,
+                         n.Threshold             = n.threshold,
+                         Thresholds              = t$thres.matrix,
+                         Item.Intercepts         = t$item.int) }) %>%
+    setNames(group.names)}
+```
+
+# I. Data preparation
+
+## 1. Import the data
+
+```{r}
+d0 = read_sav("TBIMS_cleaned.sav") %>%
+  mutate(across(1:26 & where(haven::is.labelled), haven::as_factor),
+         across(-(1:26), \(x) { attributes(x) = NULL; x }) ) %>%
+  haven::zap_formats()
+```
+
+**Prepare the data**
+
+Keep only timepoints 1-4 and remove "PRTVol"
+
+```{r}
+parto0 = d0 %>%
+  select(UID, Age, Race, Sex, Mar, EduYears,
+         Cause, CTComp, GCSTot,
+         matches("PRT.*\\.[1-4]$", ignore.case=FALSE),
+         -matches("PRTVol"))
+```
+
+Recode items into ordered factors
+
+```{r}
+parto0 = parto0 %>%
+  mutate(across(matches("^PRT(Home|School|Work)\\."),
+                ~ ordered(.x - 1, levels = 0:5,
+                          labels = c("None", "1 - 4 Hours", "5 - 9 Hours",
+                                     "10 - 19 Hours", "20 - 34 Hours",
+                                     "35 or More Hours"))),
+         across(matches("^PRT(SocFrnd|SocFam|EmotSup|Internet|EatOut|Shop|PlaySport)\\."),
+                ~ ordered(.x - 1, levels = 0:5,
+                          labels = c("None", "1 - 4 Times", "5 - 9 Times",
+                                     "10 - 19 Times", "20 - 34 Times",
+                                     "35 or More Times"))),
+         across(matches("^PRTOutHse\\."),
+                ~ ordered(.x - 1, levels = 0:4,
+                          labels = c("None", "1 - 2 Days", "3 - 4 Days",
+                                     "5 - 6 Days", "7 Days"))),
+         across(matches("^PRT(Movie|WtchSport|Religion)\\."),
+                ~ ordered(.x - 1, levels = 0:5,
+                          labels = c("None", "One Time", "Two Times",
+                                     "Three Times", "Four Times",
+                                     "Five or More Times"))),
+         across(matches("^PRT(Spouse|Relation|Friend)\\."),
+                ~ ordered(.x - 1, levels = 0:1, labels = c("No", "Yes"))) )
+```
+
+## 2. Datasets
+
+### 16-items
+
+**Check missing data**
+
+```{r}
+parto0 <- parto0 %>%
+  mutate(
+    missing_T1 = rowSums(across(contains("PRT") & ends_with(".1"), is.na)),
+    missing_T2 = rowSums(across(contains("PRT") & ends_with(".2"), is.na)),
+    missing_T3 = rowSums(across(contains("PRT") & ends_with(".3"), is.na)),
+    missing_T4 = rowSums(across(contains("PRT") & ends_with(".4"), is.na)) )
+```
+
+Cross-sectional: complete data for each timepoint (divided by race)
+
+```{r}
+parto0 %>%
+  group_by(Race) %>%
+  summarise(
+    n = n(),
+    timepoint_1 = sum(missing_T1 == 0, na.rm = TRUE),
+    timepoint_2 = sum(missing_T2 == 0, na.rm = TRUE),
+    timepoint_3 = sum(missing_T3 == 0, na.rm = TRUE),
+    timepoint_4 = sum(missing_T4 == 0, na.rm = TRUE) ) %>%
+  arrange(desc(n))
+```
+
+- Available cross-sectional data:
+  - White, Black and Hispanic patients
+  - Timepoints 1, 2, 3 and 4
+  - Lowest n = 226
+
+Longitudinal: complete data for each race (divided by T1, T1+2...)
+
+```{r}
+parto0 %>%
+  group_by(Race) %>%
+  summarise(
+    n = n(),
+    timepoint_1 = sum(missing_T1 == 0, na.rm = TRUE),
+    timepoint_1_2 = sum(missing_T1 == 0 & missing_T2 == 0, na.rm = TRUE),
+    timepoint_1_2_3 = sum(missing_T1 == 0 & missing_T2 == 0 & missing_T3 == 0, na.rm = TRUE),
+    timepoint_1_2_3_4 = sum(missing_T1 == 0 & missing_T2 == 0 & missing_T3 == 0 & missing_T4 == 0, na.rm = TRUE) ) %>%
+  arrange(desc(n))
+```
+
+- Available longitudinal data:
+  - White, Black and Hispanic patients
+  - Timepoints 1, 2 and 3
+  - Lowest n = 257
+
+**Final dataset**
+
+```{r}
+OGparto = parto0 %>%
+  filter(Race %in% c("White", "Black", "Hispanic Orgin")) %>%
+  select(1:9, matches("\\.[123]$") & !matches("Spouse")) %>%
+  mutate(Race = droplevels(Race))
+```
+
+### 11-items
+
+**Malec's modifications**
+
+- Productivity item: summed the 3 productivity items (items 1-3: Home, School, Work)
+- Social interaction item: summed the 4 social interaction items (items 4-7: SocFrnd, SocFam, EmotSup, Internet)
+- Remove overlapping item: remove Spouse (item 15), since its responses are included in Relation (item 16)
+
+```{r}
+# New summed items
+MLparto <- OGparto %>%
+  # Turn relevant items into numeric
+  mutate(across(10:30, \(x) as.numeric(x) - 1)) %>%
+  # Sum the items
+  mutate(
+    PRTProductivity.1 = rowSums(pick(PRTHome.1, PRTSchool.1, PRTWork.1)),
+    PRTProductivity.2 = rowSums(pick(PRTHome.2, PRTSchool.2, PRTWork.2)),
+    PRTProductivity.3 = rowSums(pick(PRTHome.3, PRTSchool.3, PRTWork.3)),
+    PRTSocial.1 = rowSums(pick(PRTSocFrnd.1, PRTSocFam.1,
+                               PRTEmotSup.1, PRTInternet.1)),
+    PRTSocial.2 = rowSums(pick(PRTSocFrnd.2, PRTSocFam.2,
+                               PRTEmotSup.2, PRTInternet.2)),
+    PRTSocial.3 = rowSums(pick(PRTSocFrnd.3, PRTSocFam.3,
+                               PRTEmotSup.3, PRTInternet.3)))
+
+# Re-scale the items
+MLparto <- MLparto %>%
+  mutate(
+    across(starts_with("PRTProductivity."), ~ case_when(
+      .x == 0 ~ 0,
+      .x == 1 ~ 1,
+      .x %in% 2:3 ~ 2,
+      .x %in% 4:6 ~ 3,
+      .x >= 7 ~ 4, TRUE ~ NA)),
+    across(starts_with("PRTSocial."), ~ case_when(
+      .x == 0 ~ 0,
+      .x %in% 1:4 ~ 1,
+      .x %in% 5:9 ~ 2,
+      .x %in% 10:14 ~ 3,
+      .x >= 15 ~ 4, TRUE ~ NA)) )
+
+# Items as factors
+MLparto <- MLparto %>%
+  mutate(
+    across(starts_with("PRTProductivity."),
+           ~ factor(.x, levels = 0:4, ordered = TRUE)),
+    across(starts_with("PRTSocial."),
+           ~ factor(.x, levels = 0:4, ordered = TRUE)) )
+
+# Re-order items and remove Spouse
+MLparto <- MLparto %>%
+  select(1:9,
+         matches("^PRT(Productivity|Social)\\.(1|2|3)$"),
+         matches("^PRT(OutHse|EatOut|Shop|PlaySport|Movie)\\.(1|2|3)$"),
+         matches("^PRT(WtchSport|Religion|Relation|Friend)\\.(1|2|3)$"))
+```
+
+## 3. Final prep
+
+Create a vectors with fit indices names
+
+```{r}
+names_fit = c("chisq.scaled", "df.scaled", "cfi.scaled",
+              "rmsea.scaled", "rmsea.ci.lower.scaled",
+              "rmsea.ci.upper.scaled", "srmr")
+
+names_short = c("chisq", "df", "chisq/df", "cfi", "rmsea",
+                "ci.lower", "ci.upper", "srmr")
+```
+
+Remove unnecessary objects
+
+```{r}
+rm(d0, parto0)
+```
+
+# III. Cross-sectional MI
+
+# III.A. Original version
+
+## 1. One year after TBI
+
+Create the sub-dataset
+
+```{r}
+T1.og_parto <- OGparto %>%
+  filter(Race %in% c("White", "Black", "Hispanic Orgin"),
+         if_all(matches("PRT.*\\.1$"), ~ !is.na(.)) ) %>%
+  select(1:9,
+         matches("PRT.*\\.1$"))
+nrow(T1.og_parto)
+```
+
+Create the model
+
+```{r}
+T1.og_mod = 'Participation =~ PRTHome.1 + PRTSchool.1 + PRTWork.1
+                            + PRTSocFrnd.1 + PRTSocFam.1
+                            + PRTEmotSup.1 + PRTInternet.1
+                            + PRTOutHse.1 + PRTEatOut.1 + PRTShop.1
+                            + PRTPlaySport.1 + PRTMovie.1 + PRTWtchSport.1
+                            + PRTReligion.1 + PRTRelation.1 + PRTFriend.1'
+```
+
+**Descriptive statistics**
+
+```{r}
+table1( ~ Sex +
+          Age +
+          Race +
+          Mar +
+          EduYears +
+          Cause +
+          GCSTot +
+          CTComp,
+        data = T1.og_parto)
+```
+
+
+### 1.1. Configural
+
+Create the model
+
+```{r, message=FALSE}
+T1.og_mod1 = as.character(measEq.syntax(T1.og_mod,
+                                data = T1.og_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "configural")) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T1.og_fit1 = cfa(T1.og_mod1,
+              data = T1.og_parto,
+              ordered = T,
+              group = "Race")
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T1.og_fit1, fit.measures = names_fit)
+```
+
+### 1.2. Thresholds
+
+Create the model
+
+```{r, message=FALSE}
+T1.og_mod2 = as.character(measEq.syntax(T1.og_mod,
+                                data = T1.og_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "thresholds")) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T1.og_fit2 = cfa(T1.og_mod2,
+              data = T1.og_parto,
+              ordered = T,
+              group = "Race")
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T1.og_fit2, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+fit_diff(T1.og_fit1, T1.og_fit2)
+```
+
+#### Significance
+
+Given the rejection of the level, differences in predicted probabilities are used to discover if the violation has a significant effect size (Liu et al., 2017).
+
+*Retained: configural model*
+
+```{r}
+prob_T1og_fit1 = groupProbability(fit = T1.og_fit1,
+                                n.groups = 3,
+                                factor.names = c("Participation"),
+                                item.prefixes = c("PRT"),
+                                n.item = 16,
+                                n.threshold = 5)
+```
+
+*Rejected: threshold model*
+
+```{r}
+prob_T1og_fit2 = groupProbability(fit = T1.og_fit2,
+                                n.groups = 3,
+                                factor.names = c("Participation"),
+                                item.prefixes = c("PRT"),
+                                n.item = 16,
+                                n.threshold = 5)
+```
+
+### 1.3. Loadings
+
+Create the model
+
+```{r, message=FALSE}
+T1.og_mod3 = as.character(measEq.syntax(T1.og_mod,
+                                data = T1.og_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = c("thresholds", "loadings"))) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T1.og_fit3 = cfa(T1.og_mod3,
+              data = T1.og_parto,
+              ordered = T,
+              group = "Race")
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T1.og_fit3, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+fit_diff(T1.og_fit2, T1.og_fit3)
+```
+
+### Full comparison
+
+Fit indices
+
+```{r}
+T1.og_MI <- rbind(
+  configural = fitmeasures(T1.og_fit1, fit.measures = names_fit),
+  threshold  = fitmeasures(T1.og_fit2, fit.measures = names_fit),
+  loading    = fitmeasures(T1.og_fit3, fit.measures = names_fit))
+
+T1.og_MI <- T1.og_MI %>%
+  cbind(., chisq_df = .[, "chisq.scaled"] / .[, "df.scaled"]) %>%
+  .[, c("chisq.scaled", "df.scaled", "chisq_df", "cfi.scaled", "rmsea.scaled",
+        "rmsea.ci.lower.scaled", "rmsea.ci.upper.scaled", "srmr")]
+
+T1.og_MI = round(T1.og_MI, 3)
+colnames(T1.og_MI) = names_short
+```
+
+Differences in fit indices
+
+```{r}
+T1.og_diff <- rbind(
+  conf_thres = fit_diff(T1.og_fit1, T1.og_fit2),
+  thres_load = fit_diff(T1.og_fit2, T1.og_fit3))
+```
+
+**All results**
+
+```{r}
+T1.og_results = list(MI = T1.og_MI,
+                     diff = T1.og_diff)
+T1.og_results
+```
+
+### Remove objects
+
+```{r, eval=TRUE}
+rm(T1.og_parto, T1.og_mod)
+rm(T1.og_mod1, T1.og_mod2, T1.og_mod3)
+rm(T1.og_fit1, T1.og_fit2, T1.og_fit3)
+rm(prob_T1og_fit1, prob_T1og_fit2)
+rm(T1.og_MI, T1.og_diff)
+```
+
+
+## 2. Two years after TBI
+
+Create the sub-dataset
+
+```{r}
+T2.og_parto <- OGparto %>%
+  filter(Race %in% c("White", "Black", "Hispanic Orgin"),
+         if_all(matches("PRT.*\\.2$"), ~ !is.na(.)) ) %>%
+  select(1:9,
+         matches("PRT.*\\.2$"))
+nrow(T2.og_parto)
+```
+
+Create the model
+
+```{r}
+T2.og_mod = 'Participation =~ PRTHome.2 + PRTSchool.2 + PRTWork.2
+                            + PRTSocFrnd.2 + PRTSocFam.2
+                            + PRTEmotSup.2 + PRTInternet.2
+                            + PRTOutHse.2 + PRTEatOut.2 + PRTShop.2
+                            + PRTPlaySport.2 + PRTMovie.2 + PRTWtchSport.2
+                            + PRTReligion.2 + PRTRelation.2 + PRTFriend.2'
+```
+
+**Descriptive statistics**
+
+```{r}
+table1( ~ Sex +
+          Age +
+          Race +
+          Mar +
+          EduYears +
+          Cause +
+          GCSTot +
+          CTComp,
+        data = T2.og_parto)
+```
+
+
+### 2.1. Configural
+
+Create the model
+
+```{r, message=FALSE}
+T2.og_mod1 = as.character(measEq.syntax(T2.og_mod,
+                                data = T2.og_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "configural")) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T2.og_fit1 = cfa(T2.og_mod1,
+              data = T2.og_parto,
+              ordered = T,
+              group = "Race")
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T2.og_fit1, fit.measures = names_fit)
+```
+
+### 2.2. Thresholds
+
+Create the model
+
+```{r, message=FALSE}
+T2.og_mod2 = as.character(measEq.syntax(T2.og_mod,
+                                data = T2.og_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "thresholds")) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T2.og_fit2 = cfa(T2.og_mod2,
+              data = T2.og_parto,
+              ordered = T,
+              group = "Race")
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T2.og_fit2, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+fit_diff(T2.og_fit1, T2.og_fit2)
+```
+
+#### Significance
+
+Given the rejection of the level, differences in predicted probabilities are used to discover if the violation has a significant effect size (Liu et al., 2017).
+
+*Retained: configural model*
+
+```{r}
+prob_T2og_fit1 = groupProbability(fit = T2.og_fit1,
+                                n.groups = 3,
+                                factor.names = c("Participation"),
+                                item.prefixes = c("PRT"),
+                                n.item = 16,
+                                n.threshold = 5)
+```
+
+*Rejected: threshold model*
+
+```{r}
+prob_T2og_fit2 = groupProbability(fit = T2.og_fit2,
+                                n.groups = 3,
+                                factor.names = c("Participation"),
+                                item.prefixes = c("PRT"),
+                                n.item = 16,
+                                n.threshold = 5)
+```
+
+### 2.3. Loadings
+
+Create the model
+
+```{r, message=FALSE}
+T2.og_mod3 = as.character(measEq.syntax(T2.og_mod,
+                                data = T2.og_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = c("thresholds", "loadings"))) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T2.og_fit3 = cfa(T2.og_mod3,
+              data = T2.og_parto,
+              ordered = T,
+              group = "Race")
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T2.og_fit3, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+fit_diff(T2.og_fit2, T2.og_fit3)
+```
+
+### Full comparison
+
+Fit indices
+
+```{r}
+T2.og_MI <- rbind(
+  configural = fitmeasures(T2.og_fit1, fit.measures = names_fit),
+  threshold  = fitmeasures(T2.og_fit2, fit.measures = names_fit),
+  loading    = fitmeasures(T2.og_fit3, fit.measures = names_fit))
+
+T2.og_MI <- T2.og_MI %>%
+  cbind(., chisq_df = .[, "chisq.scaled"] / .[, "df.scaled"]) %>%
+  .[, c("chisq.scaled", "df.scaled", "chisq_df", "cfi.scaled", "rmsea.scaled",
+        "rmsea.ci.lower.scaled", "rmsea.ci.upper.scaled", "srmr")]
+
+T2.og_MI = round(T2.og_MI, 3)
+colnames(T2.og_MI) = names_short
+```
+
+Differences in fit indices
+
+```{r}
+T2.og_diff <- rbind(
+  conf_thres = fit_diff(T2.og_fit1, T2.og_fit2),
+  thres_load = fit_diff(T2.og_fit2, T2.og_fit3))
+```
+
+**All results**
+
+```{r}
+T2.og_results = list(MI = T2.og_MI,
+                     diff = T2.og_diff)
+T2.og_results
+```
+
+### Remove objects
+
+```{r, eval=TRUE}
+rm(T2.og_parto, T2.og_mod)
+rm(T2.og_mod1, T2.og_mod2, T2.og_mod3)
+rm(T2.og_fit1, T2.og_fit2, T2.og_fit3)
+rm(prob_T2og_fit1, prob_T2og_fit2)
+rm(T2.og_MI, T2.og_diff)
+```
+
+## 3. Five years after TBI
+
+Create the sub-dataset
+
+```{r}
+T3.og_parto <- OGparto %>%
+  filter(Race %in% c("White", "Black", "Hispanic Orgin"),
+         if_all(matches("PRT.*\\.3$"), ~ !is.na(.)) ) %>%
+  select(1:9,
+         matches("PRT.*\\.3$"))
+nrow(T3.og_parto)
+```
+
+Create the model
+
+```{r}
+T3.og_mod = 'Participation =~ PRTHome.3 + PRTSchool.3 + PRTWork.3
+                            + PRTSocFrnd.3 + PRTSocFam.3
+                            + PRTEmotSup.3 + PRTInternet.3
+                            + PRTOutHse.3 + PRTEatOut.3 + PRTShop.3
+                            + PRTPlaySport.3 + PRTMovie.3 + PRTWtchSport.3
+                            + PRTReligion.3 + PRTRelation.3 + PRTFriend.3'
+```
+
+**Descriptive statistics**
+
+```{r}
+table1( ~ Sex +
+          Age +
+          Race +
+          Mar +
+          EduYears +
+          Cause +
+          GCSTot +
+          CTComp,
+        data = T3.og_parto)
+```
+
+**Fixing problematic item**
+
+After first attempting the configural model, item "Work" is flagged as not having "the same number of thresholds on every occasion"
+
+```{r}
+table(T3.og_parto$PRTShop.3, T3.og_parto$Race)
+```
+
+-   Given that some response categories are empty, they are collapsed to make the number of thresholds equal:
+    -   "20-34 times" and "35 or more times" are collapsed into "20 or more times"
+
+```{r}
+T3.og_parto <- T3.og_parto %>%
+  mutate(across(matches("PRTShop.3"),
+      ~ case_when(
+        grepl("None", ., ignore.case = F) ~ "None",
+        grepl("1 - 4 Times", ., ignore.case = F) ~ "1 - 4 Times",
+        grepl("5 - 9 Times", ., ignore.case = F) ~ "5 - 9 Times",
+        grepl("10 - 19 Times", ., ignore.case = F) ~ "10 - 19 Times",
+        grepl("20 - 34 Times|35 or More Times", .,
+              ignore.case = F) ~ "20 or More Times",
+    TRUE ~ NA) )) %>%
+  mutate(across(matches("PRTShop.3"),
+      ~ factor(.x,
+               levels = c("None", "1 - 4 Times", "5 - 9 Times",
+                          "10 - 19 Times", "20 or More Times"),
+               ordered = TRUE)))
+```
+
+
+### 3.1. Configural
+
+Create the model
+
+```{r, message=FALSE}
+T3.og_mod1 = as.character(measEq.syntax(T3.og_mod,
+                                data = T3.og_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "configural")) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T3.og_fit1 = cfa(T3.og_mod1,
+              data = T3.og_parto,
+              ordered = T,
+              group = "Race")
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T3.og_fit1, fit.measures = names_fit)
+```
+
+### 3.2. Thresholds
+
+Create the model
+
+```{r, message=FALSE}
+T3.og_mod2 = as.character(measEq.syntax(T3.og_mod,
+                                data = T3.og_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "thresholds")) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T3.og_fit2 = cfa(T3.og_mod2,
+              data = T3.og_parto,
+              ordered = T,
+              group = "Race")
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T3.og_fit2, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+fit_diff(T3.og_fit1, T3.og_fit2)
+```
+
+#### Significance
+
+Given the rejection of the level, differences in predicted probabilities are used to discover if the violation has a significant effect size (Liu et al., 2017).
+
+*Retained: configural model*
+
+```{r}
+prob_T3og_fit1 = groupProbability(fit = T3.og_fit1,
+                                n.groups = 3,
+                                factor.names = c("Participation"),
+                                item.prefixes = c("PRT"),
+                                n.item = 16,
+                                n.threshold = 5)
+```
+
+*Rejected: threshold model*
+
+```{r}
+prob_T3og_fit2 = groupProbability(fit = T3.og_fit2,
+                                n.groups = 3,
+                                factor.names = c("Participation"),
+                                item.prefixes = c("PRT"),
+                                n.item = 16,
+                                n.threshold = 5)
+```
+
+### 3.3. Loadings
+
+Create the model
+
+```{r, message=FALSE}
+T3.og_mod3 = as.character(measEq.syntax(T3.og_mod,
+                                data = T3.og_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = c("thresholds", "loadings"))) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T3.og_fit3 = cfa(T3.og_mod3,
+              data = T3.og_parto,
+              ordered = T,
+              group = "Race")
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T3.og_fit3, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+fit_diff(T3.og_fit2, T3.og_fit3)
+```
+
+### Full comparison
+
+Fit indices
+
+```{r}
+T3.og_MI <- rbind(
+  configural = fitmeasures(T3.og_fit1, fit.measures = names_fit),
+  threshold  = fitmeasures(T3.og_fit2, fit.measures = names_fit),
+  loading    = fitmeasures(T3.og_fit3, fit.measures = names_fit))
+
+T3.og_MI <- T3.og_MI %>%
+  cbind(., chisq_df = .[, "chisq.scaled"] / .[, "df.scaled"]) %>%
+  .[, c("chisq.scaled", "df.scaled", "chisq_df", "cfi.scaled", "rmsea.scaled",
+        "rmsea.ci.lower.scaled", "rmsea.ci.upper.scaled", "srmr")]
+
+T3.og_MI = round(T3.og_MI, 3)
+colnames(T3.og_MI) = names_short
+```
+
+Differences in fit indices
+
+```{r}
+T3.og_diff <- rbind(
+  conf_thres = fit_diff(T3.og_fit1, T3.og_fit2),
+  thres_load = fit_diff(T3.og_fit2, T3.og_fit3))
+```
+
+**All results**
+
+```{r}
+T3.og_results = list(MI = T3.og_MI,
+                     diff = T3.og_diff)
+T3.og_results
+```
+
+### Remove objects
+
+```{r, eval=TRUE}
+rm(T3.og_parto, T3.og_mod)
+rm(T3.og_mod1, T3.og_mod2, T3.og_mod3)
+rm(T3.og_fit1, T3.og_fit2, T3.og_fit3)
+rm(prob_T3og_fit1, prob_T3og_fit2)
+rm(T3.og_MI, T3.og_diff)
+```
+
+
+# III.B. Malec's version
+
+## Descriptive: proportions per timepoint
+
+```{r}
+proportions <- MLparto %>%
+  select(matches("^PRT")) %>%
+  split.default(sapply(., \(x) paste(levels(x), collapse = "|"))) %>%
+  map(\(d) d %>%
+        pivot_longer(everything(), names_to = c("item", "timepoint"),
+                     names_sep = "\\.", values_to = "response") %>%
+        drop_na(response) %>%
+        count(item, timepoint, response, .drop = FALSE) %>%
+        mutate(prop = round(n / sum(n), 2), .by = c(item, timepoint)) %>%
+        pivot_wider(id_cols = item, names_from = c(response, timepoint),
+                    values_from = prop, names_sort = TRUE))
+```
+
+## 1. One year after TBI
+
+Create the sub-dataset
+
+```{r}
+T1.ml_parto <- MLparto %>%
+  filter(Race %in% c("White", "Black", "Hispanic Orgin"),
+         if_all(matches("PRT.*\\.1$"), ~ !is.na(.)) ) %>%
+  select(1:9,
+         matches("PRT.*\\.1$"))
+nrow(T1.ml_parto)
+```
+
+Create the model
+
+```{r}
+T1.ml_mod = 'Participation =~ PRTProductivity.1 + PRTSocial.1
+                            + PRTOutHse.1 + PRTEatOut.1 + PRTShop.1
+                            + PRTPlaySport.1 + PRTMovie.1 + PRTWtchSport.1
+                            + PRTReligion.1 + PRTRelation.1 + PRTFriend.1'
+```
+
+**Descriptive statistics**
+
+```{r}
+T1desc = table1( ~ Sex +
+          Age +
+          Race +
+          Mar +
+          EduYears +
+          Cause +
+          GCSTot +
+          CTComp,
+        data = T1.ml_parto)
+```
+
+
+### 1.1. Configural
+
+Create the model
+
+```{r, message=FALSE}
+T1.ml_mod1 = as.character(measEq.syntax(T1.ml_mod,
+                                data = T1.ml_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "configural")) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T1.ml_fit1 = cfa(T1.ml_mod1,
+              data = T1.ml_parto,
+              ordered = T,
+              group = "Race")
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T1.ml_fit1, fit.measures = names_fit)
+```
+
+### 1.2. Thresholds
+
+Create the model
+
+```{r, message=FALSE}
+T1.ml_mod2 = as.character(measEq.syntax(T1.ml_mod,
+                                data = T1.ml_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "thresholds")) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T1.ml_fit2 = cfa(T1.ml_mod2,
+              data = T1.ml_parto,
+              ordered = T,
+              group = "Race")
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T1.ml_fit2, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+fit_diff(T1.ml_fit1, T1.ml_fit2)
+```
+
+#### Significance
+
+Given the rejection of the level, differences in predicted probabilities are used to discover if the violation has a significant effect size (Liu et al., 2017).
+
+*Retained: configural model*
+
+```{r}
+prob_T1ml_fit1 = groupProbability(fit = T1.ml_fit1,
+                                n.groups = 3,
+                                factor.names = c("Participation"),
+                                item.prefixes = c("PRT"),
+                                n.item = 11,
+                                n.threshold = 5)
+```
+
+*Rejected: threshold model*
+
+```{r}
+prob_T1ml_fit2 = groupProbability(fit = T1.ml_fit2,
+                                n.groups = 3,
+                                factor.names = c("Participation"),
+                                item.prefixes = c("PRT"),
+                                n.item = 11,
+                                n.threshold = 5)
+```
+
+### 1.3. Loadings
+
+Create the model
+
+```{r, message=FALSE}
+T1.ml_mod3 = as.character(measEq.syntax(T1.ml_mod,
+                                data = T1.ml_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = c("thresholds", "loadings"))) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T1.ml_fit3 = cfa(T1.ml_mod3,
+              data = T1.ml_parto,
+              ordered = T,
+              group = "Race")
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T1.ml_fit3, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+fit_diff(T1.ml_fit2, T1.ml_fit3)
+```
+
+### Full comparison
+
+Fit indices
+
+```{r}
+T1.ml_MI <- rbind(
+  configural = fitmeasures(T1.ml_fit1, fit.measures = names_fit),
+  threshold  = fitmeasures(T1.ml_fit2, fit.measures = names_fit),
+  loading    = fitmeasures(T1.ml_fit3, fit.measures = names_fit))
+
+T1.ml_MI <- T1.ml_MI %>%
+  cbind(., chisq_df = .[, "chisq.scaled"] / .[, "df.scaled"]) %>%
+  .[, c("chisq.scaled", "df.scaled", "chisq_df", "cfi.scaled", "rmsea.scaled",
+        "rmsea.ci.lower.scaled", "rmsea.ci.upper.scaled", "srmr")]
+
+T1.ml_MI = round(T1.ml_MI, 3)
+colnames(T1.ml_MI) = names_short
+```
+
+Differences in fit indices
+
+```{r}
+T1.ml_diff <- rbind(
+  conf_thres = fit_diff(T1.ml_fit1, T1.ml_fit2),
+  thres_load = fit_diff(T1.ml_fit2, T1.ml_fit3))
+```
+
+**All results**
+
+```{r}
+T1.ml_results = list(MI = T1.ml_MI,
+                     diff = T1.ml_diff)
+T1.ml_results
+```
+
+
+### Remove objects
+
+```{r, eval=TRUE}
+rm(T1.ml_parto, T1.ml_mod)
+rm(T1.ml_mod1, T1.ml_mod2, T1.ml_mod3)
+rm(T1.ml_fit1, T1.ml_fit2, T1.ml_fit3)
+rm(prob_T1ml_fit1, prob_T1ml_fit2)
+rm(T1.ml_MI, T1.ml_diff)
+```
+
+## 2. Two years after TBI
+
+Create the sub-dataset
+
+```{r}
+T2.ml_parto <- MLparto %>%
+  filter(Race %in% c("White", "Black", "Hispanic Orgin"),
+         if_all(matches("PRT.*\\.2$"), ~ !is.na(.)) ) %>%
+  select(1:9,
+         matches("PRT.*\\.2$"))
+nrow(T2.ml_parto)
+```
+
+Create the model
+
+```{r}
+T2.ml_mod = 'Participation =~ PRTProductivity.2 + PRTSocial.2
+                            + PRTOutHse.2 + PRTEatOut.2 + PRTShop.2
+                            + PRTPlaySport.2 + PRTMovie.2 + PRTWtchSport.2
+                            + PRTReligion.2 + PRTRelation.2 + PRTFriend.2'
+```
+
+**Descriptive statistics**
+
+```{r}
+T2desc = table1( ~ Sex +
+          Age +
+          Race +
+          Mar +
+          EduYears +
+          Cause +
+          GCSTot +
+          CTComp,
+        data = T2.ml_parto)
+```
+
+
+### 2.1. Configural
+
+Create the model
+
+```{r, message=FALSE}
+T2.ml_mod1 = as.character(measEq.syntax(T2.ml_mod,
+                                data = T2.ml_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "configural")) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T2.ml_fit1 = cfa(T2.ml_mod1,
+              data = T2.ml_parto,
+              ordered = T,
+              group = "Race")
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T2.ml_fit1, fit.measures = names_fit)
+```
+
+### 2.2. Thresholds
+
+Create the model
+
+```{r, message=FALSE}
+T2.ml_mod2 = as.character(measEq.syntax(T2.ml_mod,
+                                data = T2.ml_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "thresholds")) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T2.ml_fit2 = cfa(T2.ml_mod2,
+              data = T2.ml_parto,
+              ordered = T,
+              group = "Race")
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T2.ml_fit2, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+fit_diff(T2.ml_fit1, T2.ml_fit2)
+```
+
+#### Significance
+
+Given the rejection of the level, differences in predicted probabilities are used to discover if the violation has a significant effect size (Liu et al., 2017).
+
+*Retained: configural model*
+
+```{r}
+prob_T2ml_fit1 = groupProbability(fit = T2.ml_fit1,
+                                n.groups = 3,
+                                factor.names = c("Participation"),
+                                item.prefixes = c("PRT"),
+                                n.item = 11,
+                                n.threshold = 5)
+```
+
+*Rejected: threshold model*
+
+```{r}
+prob_T2ml_fit2 = groupProbability(fit = T2.ml_fit2,
+                                n.groups = 3,
+                                factor.names = c("Participation"),
+                                item.prefixes = c("PRT"),
+                                n.item = 11,
+                                n.threshold = 5)
+```
+
+### 2.3. Loadings
+
+Create the model
+
+```{r, message=FALSE}
+T2.ml_mod3 = as.character(measEq.syntax(T2.ml_mod,
+                                data = T2.ml_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = c("thresholds", "loadings"))) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T2.ml_fit3 = cfa(T2.ml_mod3,
+              data = T2.ml_parto,
+              ordered = T,
+              group = "Race")
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T2.ml_fit3, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+fit_diff(T2.ml_fit2, T2.ml_fit3)
+```
+
+### Full comparison
+
+Fit indices
+
+```{r}
+T2.ml_MI <- rbind(
+  configural = fitmeasures(T2.ml_fit1, fit.measures = names_fit),
+  threshold  = fitmeasures(T2.ml_fit2, fit.measures = names_fit),
+  loading    = fitmeasures(T2.ml_fit3, fit.measures = names_fit))
+
+T2.ml_MI <- T2.ml_MI %>%
+  cbind(., chisq_df = .[, "chisq.scaled"] / .[, "df.scaled"]) %>%
+  .[, c("chisq.scaled", "df.scaled", "chisq_df", "cfi.scaled", "rmsea.scaled",
+        "rmsea.ci.lower.scaled", "rmsea.ci.upper.scaled", "srmr")]
+
+T2.ml_MI = round(T2.ml_MI, 3)
+colnames(T2.ml_MI) = names_short
+```
+
+Differences in fit indices
+
+```{r}
+T2.ml_diff <- rbind(
+  conf_thres = fit_diff(T2.ml_fit1, T2.ml_fit2),
+  thres_load = fit_diff(T2.ml_fit2, T2.ml_fit3))
+```
+
+**All results**
+
+```{r}
+T2.ml_results = list(MI = T2.ml_MI,
+                     diff = T2.ml_diff)
+T2.ml_results
+```
+
+### Remove objects
+
+```{r, eval=TRUE}
+rm(T2.ml_parto, T2.ml_mod)
+rm(T2.ml_mod1, T2.ml_mod2, T2.ml_mod3)
+rm(T2.ml_fit1, T2.ml_fit2, T2.ml_fit3)
+rm(prob_T2ml_fit1, prob_T2ml_fit2)
+rm(T2.ml_MI, T2.ml_diff)
+```
+
+## 3. Five years after TBI
+
+Create the sub-dataset
+
+```{r}
+T3.ml_parto <- MLparto %>%
+  filter(Race %in% c("White", "Black", "Hispanic Orgin"),
+         if_all(matches("PRT.*\\.3$"), ~ !is.na(.)) ) %>%
+  select(1:9,
+         matches("PRT.*\\.3$"))
+nrow(T3.ml_parto)
+```
+
+Create the model
+
+```{r}
+T3.ml_mod = 'Participation =~ PRTProductivity.3 + PRTSocial.3
+                            + PRTOutHse.3 + PRTEatOut.3 + PRTShop.3
+                            + PRTPlaySport.3 + PRTMovie.3 + PRTWtchSport.3
+                            + PRTReligion.3 + PRTRelation.3 + PRTFriend.3'
+```
+
+**Descriptive statistics**
+
+```{r}
+T3desc = table1( ~ Sex +
+          Age +
+          Race +
+          Mar +
+          EduYears +
+          Cause +
+          GCSTot +
+          CTComp,
+        data = T3.ml_parto)
+```
+
+**Fixing problematic item**
+
+After first attempting the configural model, item "Shop" is flagged as not having "the same number of thresholds on every occasion"
+
+```{r}
+table(T3.ml_parto$PRTShop.3, T3.ml_parto$Race)
+```
+
+-   Given that some response categories are empty, they are collapsed to make the number of thresholds equal:
+    -   "20-34 times" and "35 or more times" are collapsed into "20 or more times"
+
+```{r}
+T3.ml_parto <- T3.ml_parto %>%
+  mutate(across(matches("PRTShop.3"),
+      ~ case_when(
+        grepl("None", ., ignore.case = F) ~ "None",
+        grepl("1 - 4 Times", ., ignore.case = F) ~ "1 - 4 Times",
+        grepl("5 - 9 Times", ., ignore.case = F) ~ "5 - 9 Times",
+        grepl("10 - 19 Times", ., ignore.case = F) ~ "10 - 19 Times",
+        grepl("20 - 34 Times|35 or More Times", .,
+              ignore.case = F) ~ "20 or More Times",
+    TRUE ~ NA) )) %>%
+  mutate(across(matches("PRTShop.3"),
+      ~ factor(.x,
+               levels = c("None", "1 - 4 Times", "5 - 9 Times",
+                          "10 - 19 Times", "20 or More Times"),
+               ordered = TRUE)))
+```
+
+
+### 3.1. Configural
+
+Create the model
+
+```{r, message=FALSE}
+T3.ml_mod1 = as.character(measEq.syntax(T3.ml_mod,
+                                data = T3.ml_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "configural")) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T3.ml_fit1 = cfa(T3.ml_mod1,
+              data = T3.ml_parto,
+              ordered = T,
+              group = "Race")
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T3.ml_fit1, fit.measures = names_fit)
+```
+
+### 3.2. Thresholds
+
+Create the model
+
+```{r, message=FALSE}
+T3.ml_mod2 = as.character(measEq.syntax(T3.ml_mod,
+                                data = T3.ml_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "thresholds")) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T3.ml_fit2 = cfa(T3.ml_mod2,
+              data = T3.ml_parto,
+              ordered = T,
+              group = "Race")
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T3.ml_fit2, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+fit_diff(T3.ml_fit1, T3.ml_fit2)
+```
+
+#### Significance
+
+Given the rejection of the level, differences in predicted probabilities are used to discover if the violation has a significant effect size (Liu et al., 2017).
+
+*Retained: configural model*
+
+```{r}
+prob_T3ml_fit1 = groupProbability(fit = T3.ml_fit1,
+                                n.groups = 3,
+                                factor.names = c("Participation"),
+                                item.prefixes = c("PRT"),
+                                n.item = 11,
+                                n.threshold = 5)
+```
+
+*Rejected: threshold model*
+
+```{r}
+prob_T3ml_fit2 = groupProbability(fit = T3.ml_fit2,
+                                n.groups = 3,
+                                factor.names = c("Participation"),
+                                item.prefixes = c("PRT"),
+                                n.item = 11,
+                                n.threshold = 5)
+```
+
+### 3.3. Loadings
+
+Create the model
+
+```{r, message=FALSE}
+T3.ml_mod3 = as.character(measEq.syntax(T3.ml_mod,
+                                data = T3.ml_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = c("thresholds", "loadings"))) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T3.ml_fit3 = cfa(T3.ml_mod3,
+              data = T3.ml_parto,
+              ordered = T,
+              group = "Race")
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T3.ml_fit3, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+fit_diff(T3.ml_fit2, T3.ml_fit3)
+```
+
+### Full comparison
+
+Fit indices
+
+```{r}
+T3.ml_MI <- rbind(
+  configural = fitmeasures(T3.ml_fit1, fit.measures = names_fit),
+  threshold  = fitmeasures(T3.ml_fit2, fit.measures = names_fit),
+  loading    = fitmeasures(T3.ml_fit3, fit.measures = names_fit))
+
+T3.ml_MI <- T3.ml_MI %>%
+  cbind(., chisq_df = .[, "chisq.scaled"] / .[, "df.scaled"]) %>%
+  .[, c("chisq.scaled", "df.scaled", "chisq_df", "cfi.scaled", "rmsea.scaled",
+        "rmsea.ci.lower.scaled", "rmsea.ci.upper.scaled", "srmr")]
+
+T3.ml_MI = round(T3.ml_MI, 3)
+colnames(T3.ml_MI) = names_short
+```
+
+Differences in fit indices
+
+```{r}
+T3.ml_diff <- rbind(
+  conf_thres = fit_diff(T3.ml_fit1, T3.ml_fit2),
+  thres_load = fit_diff(T3.ml_fit2, T3.ml_fit3))
+```
+
+**All results**
+
+```{r}
+T3.ml_results = list(MI = T3.ml_MI,
+                     diff = T3.ml_diff)
+T3.ml_results
+```
+
+
+### Remove objects
+
+```{r, eval=TRUE}
+rm(T3.ml_parto, T3.ml_mod)
+rm(T3.ml_mod1, T3.ml_mod2, T3.ml_mod3)
+rm(T3.ml_fit1, T3.ml_fit2, T3.ml_fit3)
+rm(prob_T3ml_fit1, prob_T3ml_fit2)
+rm(T3.ml_MI, T3.ml_diff)
+```
+
+
+## Comparison
+
+### 1.Timepoint 1
+
+**Fit indices**
+
+```{r}
+T1.og_results$MI
+T1.ml_results$MI
+```
+
+- Malec's version shows better fit values.
+
+**Differences**
+
+```{r}
+T1.og_results$diff
+T1.ml_results$diff
+```
+
+- Malec's version shows smaller differences in fit.
+
+### 2. Timepoint 2
+
+**Fit indices**
+
+```{r}
+T2.og_results$MI
+T2.ml_results$MI
+```
+
+- Malec's version shows better fit values.
+
+**Differences**
+
+```{r}
+T2.og_results$diff
+T2.ml_results$diff
+```
+
+- Malec's version shows smaller differences in fit.
+
+
+### 3. Timepoint 3
+
+**Fit indices**
+
+```{r}
+T3.og_results$MI
+T3.ml_results$MI
+```
+
+- Malec's version shows better fit values.
+
+**Differences**
+
+```{r}
+T3.og_results$diff
+T3.ml_results$diff
+```
+
+- Malec's version shows smaller differences in fit.
+
+## Export results
+
+```{r, eval=FALSE}
+library(writexl)
+```
+
+Descriptive (cross-sectional)
+
+```{r, eval=FALSE}
+writeLines(paste(
+    "<h2>Timepoint 1</h2>",
+    as.character(T1desc),
+    "<h2>Timepoint 2</h2>",
+    as.character(T2desc),
+    "<h2>Timepoint 3</h2>",
+    as.character(T3desc)),
+  "data/descriptivesCross.html")
+```
+
+Proportions
+
+```{r, eval=FALSE}
+write_xlsx(proportions, "data/proportiontables.xlsx")
+```
+
+Fit indices
+
+```{r, eval=FALSE}
+toexcel <- \(x) data.frame(model = rownames(x), x, check.names = FALSE)
+
+write_xlsx(list(
+  T1_og_MI   = toexcel(T1.og_results$MI),
+  T1_og_diff = toexcel(T1.og_results$diff),
+  T1_ml_MI   = toexcel(T1.ml_results$MI),
+  T1_ml_diff = toexcel(T1.ml_results$diff)),
+  "data/T1_results.xlsx")
+
+write_xlsx(list(
+  T2_og_MI   = toexcel(T2.og_results$MI),
+  T2_og_diff = toexcel(T2.og_results$diff),
+  T2_ml_MI   = toexcel(T2.ml_results$MI),
+  T2_ml_diff = toexcel(T2.ml_results$diff)),
+  "data/T2_results.xlsx")
+
+write_xlsx(list(
+  T3_og_MI   = toexcel(T3.og_results$MI),
+  T3_og_diff = toexcel(T3.og_results$diff),
+  T3_ml_MI   = toexcel(T3.ml_results$MI),
+  T3_ml_diff = toexcel(T3.ml_results$diff)),
+  "data/T3_results.xlsx")
+```
+

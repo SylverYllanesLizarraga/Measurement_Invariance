@@ -1,0 +1,1162 @@
+---
+title: "PARTO - Longitudinal Measurement invariance"
+author: "Sylver Yllanes-Lizarraga"
+
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    self_contained: true
+  pdf_document:
+    toc: true
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Libraries
+
+```{r, message=FALSE, warning=FALSE}
+library(foreign)
+library(haven)
+library(dplyr)
+library(stringr)
+library(table1)
+library(openxlsx)
+library(tidyr)
+
+library(lavaan)
+library(EGAnet)
+library(psych)
+library(semTools)
+```
+
+# Auxiliary functions
+
+`fit_diff()`, to summarize the differences between invariance levels
+
+```{r}
+fit_diff <- function(fit1, fit2) {
+  lrt <- lavTestLRT(fit1, fit2)
+  data.frame(D.chisq = round(lrt$`Chisq diff`[2], 2),
+             D.df = lrt$`Df diff`[2],
+             pvalue = signif(lrt$`Pr(>Chisq)`[2], 3),
+             D.cfi = round(unname(fitMeasures(fit2, "cfi.scaled") -
+                                   fitMeasures(fit1, "cfi.scaled")), 3),
+             D.rmsea = round(unname(fitMeasures(fit2, "rmsea.scaled") -
+                                     fitMeasures(fit1, "rmsea.scaled")), 3))}
+```
+
+`extract_elements()`, to extract the necessary information for `ThresholdProbability()`. This version works for the cross-sectional models
+
+```{r}
+extract_elements = function(fit,
+                            group.id,
+                            factor.names,
+                            item.prefixes,
+                            n.item,
+                            n.threshold) {
+  
+  par.estim = parameterEstimates(fit)
+  
+  # --- Item order from loadings (source of truth) ---
+  item.names = par.estim[par.estim$op == "=~" &
+                         par.estim$group == group.id, "rhs"]
+  
+  # --- Thresholds (NA-padded, ordered to match loadings) ---
+  thres.df  = par.estim[par.estim$op == "|" &
+                        Reduce(`|`, lapply(item.prefixes, function(p) startsWith(par.estim$lhs, p))) &
+                        par.estim$group == group.id, c("lhs", "est")]
+  
+  thres.mat = matrix(NA, nrow = length(item.names), ncol = n.threshold)
+  
+  for (i in seq_along(item.names)) {
+    vals = thres.df$est[thres.df$lhs == item.names[i]]
+    if (length(vals) > 0) thres.mat[i, 1:length(vals)] = vals }
+  
+  # --- Loadings ---
+  loadings = par.estim[par.estim$op == "=~" &
+                       par.estim$group == group.id, "est"]
+  
+  # --- Factor means ---
+  com.factor.mean = par.estim[par.estim$op == "~1" &
+                              par.estim$lhs %in% factor.names &
+                              par.estim$group == group.id, "est"]
+  
+  # --- Factor variances ---
+  com.factor.var = par.estim[par.estim$op == "~~" &
+                             par.estim$lhs %in% factor.names &
+                             par.estim$rhs == par.estim$lhs &
+                             par.estim$group == group.id, "est"]
+  
+  # --- Unique factor variances (ordered to match loadings) ---
+  uni.factor.var = par.estim[par.estim$op == "~~" &
+                             par.estim$rhs == par.estim$lhs &
+                             par.estim$lhs %in% item.names &
+                             par.estim$group == group.id, "est"]
+  
+  # --- Item intercepts (ordered to match loadings) ---
+  item.int = sapply(item.names, function(v)
+    par.estim$est[par.estim$op == "~1" &
+                  par.estim$lhs == v &
+                  par.estim$group == group.id])
+  
+  list(loadings        = loadings,
+       com.factor.mean = com.factor.mean,
+       com.factor.var  = com.factor.var,
+       uni.factor.var  = uni.factor.var,
+       item.int        = item.int,
+       thres.matrix    = thres.mat) }
+```
+
+Modified `ThresholdProbability()`, to calculate the estimated probabilities for choosing each response category for each item (Liu et al., 2017)
+
+```{r}
+ThresholdProbability = function(n.Item,
+                                Loadings,                 # matrix: n.Item x n.Factors
+                                Common.Factor.Mean,       # vector: length n.Factors
+                                Common.Factor.Variance,   # matrix: n.Factors x n.Factors
+                                Unique.Factor.Variances,  # vector: length n.Item
+                                n.Threshold,
+                                Thresholds,               # matrix: n.Item x n.Threshold
+                                Item.Intercepts) {        # vector, length n.Item
+  
+  LAMBDA = as.matrix(Loadings)                   # n.Item x n.Factors
+  KAPPA  = as.matrix(Common.Factor.Mean)         # n.Factors x 1
+  PHI    = as.matrix(Common.Factor.Variance)     # n.Factors x n.Factors
+  THETA  = diag(Unique.Factor.Variances)         # n.Item x n.Item
+  
+  MU    = as.matrix(Item.Intercepts) + LAMBDA %*% KAPPA   # CHANGED (was LAMBDA %*% KAPPA): n.Item x 1
+  SIGMA = LAMBDA %*% PHI %*% t(LAMBDA) + THETA   # n.Item x n.Item
+  
+  Item.SDs = sqrt(diag(SIGMA))
+  
+  p.LE.Threshold      = matrix(NA, nrow = n.Item, ncol = n.Threshold)
+  p.within.Thresholds = matrix(NA, nrow = n.Item, ncol = n.Threshold + 1)
+  
+  for (i in 1:n.Item) {
+    for (j in 1:n.Threshold) {
+      p.LE.Threshold[i, j] = pnorm(Thresholds[i, j], mean = MU[i], sd = Item.SDs[i]) }}
+  
+  for (i in 1:n.Item) {
+    p.within.Thresholds[i, 1] = p.LE.Threshold[i, 1]
+    last.valid = max(which(!is.na(p.LE.Threshold[i, ])))  # handles variable # of thresholds per item
+    
+    if (last.valid < n.Threshold) {
+      # Item has fewer active thresholds than the max
+      p.within.Thresholds[i, last.valid + 1] = 1 - p.LE.Threshold[i, last.valid]
+      if (last.valid > 1) {
+        for (j in 2:last.valid) {
+          p.within.Thresholds[i, j] = p.LE.Threshold[i, j] - p.LE.Threshold[i, j - 1] }}}
+    else {
+      p.within.Thresholds[i, n.Threshold + 1] = 1 - p.LE.Threshold[i, n.Threshold]
+      for (j in 2:n.Threshold) {
+        p.within.Thresholds[i, j] = p.LE.Threshold[i, j] - p.LE.Threshold[i, j - 1] }}}
+  
+  return(p.within.Thresholds)}
+```
+
+`groupProbability`, to call both previous functions more easily
+
+```{r}
+groupProbability = function(fit,
+                            n.groups,
+                            factor.names,
+                            item.prefixes,
+                            n.item,
+                            n.threshold,
+                            group.names = lavInspect(fit, "group.label")) {
+  lapply(1:n.groups, function(group_id) {
+    t = extract_elements(fit           = fit,
+                          group.id      = group_id,
+                          factor.names  = factor.names,
+                          item.prefixes = item.prefixes,
+                          n.item        = n.item,
+                          n.threshold   = n.threshold)
+    
+    ThresholdProbability(n.Item                  = n.item,
+                         Loadings                = matrix(t$loadings, nrow = n.item, ncol = length(factor.names)),
+                         Common.Factor.Mean      = matrix(t$com.factor.mean, ncol = 1),
+                         Common.Factor.Variance  = diag(t$com.factor.var, nrow = length(factor.names)),
+                         Unique.Factor.Variances = t$uni.factor.var,
+                         n.Threshold             = n.threshold,
+                         Thresholds              = t$thres.matrix,
+                         Item.Intercepts         = t$item.int) }) %>%
+    setNames(group.names)}
+```
+
+# I. Data preparation
+
+## 1. Import the data
+
+```{r}
+d0 = read_sav("TBIMS_cleaned.sav") %>%
+  mutate(across(1:26 & where(haven::is.labelled), haven::as_factor),
+         across(-(1:26), \(x) { attributes(x) = NULL; x }) ) %>%
+  haven::zap_formats()
+```
+
+**Prepare the data**
+
+Keep only timepoints 1-4 and remove "PRTVol"
+
+```{r}
+parto0 = d0 %>%
+  select(UID, Age, Race, Sex, Mar, EduYears,
+         Cause, CTComp, GCSTot,
+         matches("PRT.*\\.[1-4]$", ignore.case=FALSE),
+         -matches("PRTVol"))
+```
+
+Recode items into ordered factors
+
+```{r}
+parto0 = parto0 %>%
+  mutate(across(matches("^PRT(Home|School|Work)\\."),
+                ~ ordered(.x - 1, levels = 0:5,
+                          labels = c("None", "1 - 4 Hours", "5 - 9 Hours",
+                                     "10 - 19 Hours", "20 - 34 Hours",
+                                     "35 or More Hours"))),
+         across(matches("^PRT(SocFrnd|SocFam|EmotSup|Internet|EatOut|Shop|PlaySport)\\."),
+                ~ ordered(.x - 1, levels = 0:5,
+                          labels = c("None", "1 - 4 Times", "5 - 9 Times",
+                                     "10 - 19 Times", "20 - 34 Times",
+                                     "35 or More Times"))),
+         across(matches("^PRTOutHse\\."),
+                ~ ordered(.x - 1, levels = 0:4,
+                          labels = c("None", "1 - 2 Days", "3 - 4 Days",
+                                     "5 - 6 Days", "7 Days"))),
+         across(matches("^PRT(Movie|WtchSport|Religion)\\."),
+                ~ ordered(.x - 1, levels = 0:5,
+                          labels = c("None", "One Time", "Two Times",
+                                     "Three Times", "Four Times",
+                                     "Five or More Times"))),
+         across(matches("^PRT(Spouse|Relation|Friend)\\."),
+                ~ ordered(.x - 1, levels = 0:1, labels = c("No", "Yes"))) )
+```
+
+## 2. Datasets
+
+### 16-items
+
+**Check missing data**
+
+```{r}
+parto0 <- parto0 %>%
+  mutate(
+    missing_T1 = rowSums(across(contains("PRT") & ends_with(".1"), is.na)),
+    missing_T2 = rowSums(across(contains("PRT") & ends_with(".2"), is.na)),
+    missing_T3 = rowSums(across(contains("PRT") & ends_with(".3"), is.na)),
+    missing_T4 = rowSums(across(contains("PRT") & ends_with(".4"), is.na)) )
+```
+
+Cross-sectional: complete data for each timepoint (divided by race)
+
+```{r}
+parto0 %>%
+  group_by(Race) %>%
+  summarise(
+    n = n(),
+    timepoint_1 = sum(missing_T1 == 0, na.rm = TRUE),
+    timepoint_2 = sum(missing_T2 == 0, na.rm = TRUE),
+    timepoint_3 = sum(missing_T3 == 0, na.rm = TRUE),
+    timepoint_4 = sum(missing_T4 == 0, na.rm = TRUE) ) %>%
+  arrange(desc(n))
+```
+
+- Available cross-sectional data:
+  - White, Black and Hispanic patients
+  - Timepoints 1, 2, 3 and 4
+  - Lowest n = 226
+
+Longitudinal: complete data for each race (divided by T1, T1+2...)
+
+```{r}
+parto0 %>%
+  group_by(Race) %>%
+  summarise(
+    n = n(),
+    timepoint_1 = sum(missing_T1 == 0, na.rm = TRUE),
+    timepoint_1_2 = sum(missing_T1 == 0 & missing_T2 == 0, na.rm = TRUE),
+    timepoint_1_2_3 = sum(missing_T1 == 0 & missing_T2 == 0 & missing_T3 == 0, na.rm = TRUE),
+    timepoint_1_2_3_4 = sum(missing_T1 == 0 & missing_T2 == 0 & missing_T3 == 0 & missing_T4 == 0, na.rm = TRUE) ) %>%
+  arrange(desc(n))
+```
+
+- Available longitudinal data:
+  - White, Black and Hispanic patients
+  - Timepoints 1, 2 and 3
+  - Lowest n = 257
+
+**Final dataset**
+
+```{r}
+OGparto = parto0 %>%
+  filter(Race %in% c("White", "Black", "Hispanic Orgin")) %>%
+  select(1:9, matches("\\.[123]$") & !matches("Spouse")) %>%
+  mutate(Race = droplevels(Race))
+```
+
+### 11-items
+
+**Malec's modifications**
+
+- Productivity item: summed the 3 productivity items (items 1-3: Home, School, Work)
+- Social interaction item: summed the 4 social interaction items (items 4-7: SocFrnd, SocFam, EmotSup, Internet)
+- Remove overlapping item: remove Spouse (item 15), since its responses are included in Relation (item 16)
+
+```{r}
+# New summed items
+MLparto <- OGparto %>%
+  # Turn relevant items into numeric
+  mutate(across(10:30, \(x) as.numeric(x) - 1)) %>%
+  # Sum the items
+  mutate(
+    PRTProductivity.1 = rowSums(pick(PRTHome.1, PRTSchool.1, PRTWork.1)),
+    PRTProductivity.2 = rowSums(pick(PRTHome.2, PRTSchool.2, PRTWork.2)),
+    PRTProductivity.3 = rowSums(pick(PRTHome.3, PRTSchool.3, PRTWork.3)),
+    PRTSocial.1 = rowSums(pick(PRTSocFrnd.1, PRTSocFam.1,
+                               PRTEmotSup.1, PRTInternet.1)),
+    PRTSocial.2 = rowSums(pick(PRTSocFrnd.2, PRTSocFam.2,
+                               PRTEmotSup.2, PRTInternet.2)),
+    PRTSocial.3 = rowSums(pick(PRTSocFrnd.3, PRTSocFam.3,
+                               PRTEmotSup.3, PRTInternet.3)))
+
+# Re-scale the items
+MLparto <- MLparto %>%
+  mutate(
+    across(starts_with("PRTProductivity."), ~ case_when(
+      .x == 0 ~ 0,
+      .x == 1 ~ 1,
+      .x %in% 2:3 ~ 2,
+      .x %in% 4:6 ~ 3,
+      .x >= 7 ~ 4, TRUE ~ NA)),
+    across(starts_with("PRTSocial."), ~ case_when(
+      .x == 0 ~ 0,
+      .x %in% 1:4 ~ 1,
+      .x %in% 5:9 ~ 2,
+      .x %in% 10:14 ~ 3,
+      .x >= 15 ~ 4, TRUE ~ NA)) )
+
+# Items as factors
+MLparto <- MLparto %>%
+  mutate(
+    across(starts_with("PRTProductivity."),
+           ~ factor(.x, levels = 0:4, ordered = TRUE)),
+    across(starts_with("PRTSocial."),
+           ~ factor(.x, levels = 0:4, ordered = TRUE)) )
+
+# Re-order items and remove Spouse
+MLparto <- MLparto %>%
+  select(1:9,
+         matches("^PRT(Productivity|Social)\\.(1|2|3)$"),
+         matches("^PRT(OutHse|EatOut|Shop|PlaySport|Movie)\\.(1|2|3)$"),
+         matches("^PRT(WtchSport|Religion|Relation|Friend)\\.(1|2|3)$"))
+```
+
+## 3. Final prep
+
+Create a vectors with fit indices names
+
+```{r}
+names_fit = c("chisq.scaled", "df.scaled", "cfi.scaled",
+              "rmsea.scaled", "rmsea.ci.lower.scaled",
+              "rmsea.ci.upper.scaled", "srmr")
+
+names_short = c("chisq", "df", "chisq/df", "cfi", "rmsea",
+                "ci.lower", "ci.upper", "srmr")
+```
+
+Remove unnecessary objects
+
+```{r}
+rm(d0, parto0, OGparto)
+```
+
+# IV. Longitudinal MI (Malec's version)
+
+Create the model
+
+```{r}
+long.ml_mod = 'Participation.1 =~ PRTProductivity.1 + PRTSocial.1
+                            + PRTOutHse.1 + PRTEatOut.1 + PRTShop.1
+                            + PRTPlaySport.1 + PRTMovie.1 + PRTWtchSport.1
+                            + PRTReligion.1 + PRTRelation.1 + PRTFriend.1
+               Participation.2 =~ PRTProductivity.2 + PRTSocial.2
+                            + PRTOutHse.2 + PRTEatOut.2 + PRTShop.2
+                            + PRTPlaySport.2 + PRTMovie.2 + PRTWtchSport.2
+                            + PRTReligion.2 + PRTRelation.2 + PRTFriend.2
+               Participation.3 =~ PRTProductivity.3 + PRTSocial.3
+                            + PRTOutHse.3 + PRTEatOut.3 + PRTShop.3
+                            + PRTPlaySport.3 + PRTMovie.3 + PRTWtchSport.3
+                            + PRTReligion.3 + PRTRelation.3 + PRTFriend.3'
+```
+
+Create factor correspondence
+
+```{r}
+long.ml_factors = list(Participation = c("Participation.1", "Participation.2",
+                                         "Participation.3"))
+```
+
+**Descriptive statistics**
+
+```{r}
+R.ml_parto <- MLparto %>%
+  filter(Race %in% c("White", "Black", "Hispanic Orgin"),
+         if_all(matches("PRT.*\\.(1|2|3)$"), ~ !is.na(.)) ) %>%
+  select(1:9,
+         matches("PRT.*\\.(1|2|3)$"))
+nrow(R.ml_parto)
+```
+
+```{r}
+Rdesc = table1( ~ Sex +
+          Age +
+          Race +
+          Mar +
+          EduYears +
+          Cause +
+          GCSTot +
+          CTComp,
+        data = R.ml_parto)
+```
+
+## IV.A. Full sample
+
+#### 1.1. Configural
+
+Create the model
+
+```{r, message=FALSE}
+R.ml_mod1 = as.character(measEq.syntax(long.ml_mod,
+                                data = R.ml_parto,     
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long.ml_factors,
+                                long.equal = "configural")) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+R.ml_fit1 = cfa(R.ml_mod1,
+             data = R.ml_parto,
+             ordered = T, std.lv = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(R.ml_fit1, fit.measures = names_fit)
+```
+
+
+#### 1.2. Thresholds
+
+Create the model
+
+```{r, message=FALSE}
+R.ml_mod2 = as.character(measEq.syntax(long.ml_mod,
+                                data = R.ml_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long.ml_factors,
+                                long.equal = "thresholds")) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+R.ml_fit2 = cfa(R.ml_mod2,
+             data = R.ml_parto,
+             ordered = T, std.lv = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(R.ml_fit2, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(R.ml_fit1, R.ml_fit2)
+```
+
+#### 1.3. Loadings
+
+Create the model
+
+```{r, message=FALSE}
+R.ml_mod3 = as.character(measEq.syntax(long.ml_mod,
+                                data = R.ml_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long.ml_factors,
+                                long.equal = c("thresholds", "loadings"))) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+R.ml_fit3 = cfa(R.ml_mod3,
+             data = R.ml_parto,
+             ordered = T, std.lv = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(R.ml_fit3, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(R.ml_fit2, R.ml_fit3)
+```
+
+#### Full comparison
+
+Fit indices
+
+```{r}
+R.ml_MI <- rbind(
+  configural = fitmeasures(R.ml_fit1, fit.measures = names_fit),
+  threshold  = fitmeasures(R.ml_fit2, fit.measures = names_fit),
+  loading    = fitmeasures(R.ml_fit3, fit.measures = names_fit))
+
+R.ml_MI <- R.ml_MI %>%
+  cbind(., chisq_df = .[, "chisq.scaled"] / .[, "df.scaled"]) %>%
+  .[, c("chisq.scaled", "df.scaled", "chisq_df", "cfi.scaled", "rmsea.scaled",
+        "rmsea.ci.lower.scaled", "rmsea.ci.upper.scaled", "srmr")]
+
+R.ml_MI = round(R.ml_MI, 3)
+colnames(R.ml_MI) = names_short
+```
+
+Differences in fit indices
+
+```{r}
+R.ml_diff <- rbind(
+  conf_thres = fit_diff(R.ml_fit1, R.ml_fit2),
+  thres_load = fit_diff(R.ml_fit2, R.ml_fit3))
+```
+
+**All results**
+
+```{r}
+R.ml_results = list(MI = R.ml_MI,
+                    diff = R.ml_diff)
+R.ml_results
+```
+
+#### Remove objects
+
+```{r, eval=TRUE}
+rm(R.ml_mod1, R.ml_mod2, R.ml_mod3)
+rm(R.ml_fit1, R.ml_fit2, R.ml_fit3)
+rm(R.ml_MI,   R.ml_diff)
+```
+
+
+## IV.B. Per group (sensitivity analysis)
+
+### Preparing the data
+
+**Creating the datasets**
+
+```{r}
+W.ml_parto <- R.ml_parto %>%
+  filter(Race %in% c("White"),
+         if_all(matches("PRT.*\\.(1|2|3)$"), ~ !is.na(.)) ) %>%
+  select(1:9,
+         matches("PRT.*\\.(1|2|3)$"))
+nrow(W.ml_parto)
+```
+
+```{r}
+B.ml_parto <- R.ml_parto %>%
+  filter(Race %in% c("Black"),
+         if_all(matches("PRT.*\\.(1|2|3)$"), ~ !is.na(.)) ) %>%
+  select(1:9,
+         matches("PRT.*\\.(1|2|3)$"))
+nrow(B.ml_parto)
+```
+
+```{r}
+H.ml_parto <- R.ml_parto %>%
+  filter(Race %in% c("Hispanic Orgin"),
+         if_all(matches("PRT.*\\.(1|2|3)$"), ~ !is.na(.)) ) %>%
+  select(1:9,
+         matches("PRT.*\\.(1|2|3)$"))
+nrow(H.ml_parto)
+```
+
+**Correcting sparsity**
+
+The Hispanic subgroup shows sparse data on the item Shop
+
+```{r}
+freqs = list(W = W.ml_parto, B = B.ml_parto, H = H.ml_parto) %>%
+  lapply(\(d) d %>%
+           select(matches("^PRTShop\\.[1-3]$")) %>%
+           pivot_longer(everything()) %>%
+           with(table(value, name)))
+freqs
+```
+
+-   The category "35 or More Times" is empty in the Hispanic group at T3, and is also sparse in the Black and Hispanic groups.
+-   Thus, it is collapsed and merged with the category "20 - 34 Times"
+
+```{r}
+W.ml_parto = W.ml_parto %>%
+  mutate(across(matches("PRTShop"),
+                ~ case_when(grepl("20 - 34 Times|35 or More Times", .x)
+                            ~ "20 or More Times",
+                            .default = .x) %>%
+                  factor(levels = c("None", "1 - 4 Times", "5 - 9 Times",
+                                    "10 - 19 Times", "20 or More Times"),
+                         ordered = TRUE)))
+
+B.ml_parto = B.ml_parto %>%
+  mutate(across(matches("PRTShop"),
+                ~ case_when(grepl("20 - 34 Times|35 or More Times", .x)
+                            ~ "20 or More Times",
+                            .default = .x) %>%
+                  factor(levels = c("None", "1 - 4 Times", "5 - 9 Times",
+                                    "10 - 19 Times", "20 or More Times"),
+                         ordered = TRUE)))
+
+H.ml_parto = H.ml_parto %>%
+  mutate(across(matches("PRTShop"),
+                ~ case_when(grepl("20 - 34 Times|35 or More Times", .x)
+                            ~ "20 or More Times",
+                            .default = .x) %>%
+                  factor(levels = c("None", "1 - 4 Times", "5 - 9 Times",
+                                    "10 - 19 Times", "20 or More Times"),
+                         ordered = TRUE)))
+```
+
+```{r}
+table1( ~ Sex +
+          Age +
+          Race +
+          Mar +
+          EduYears +
+          Cause +
+          GCSTot +
+          CTComp,
+        data = W.ml_parto)
+
+table1( ~ Sex +
+          Age +
+          Race +
+          Mar +
+          EduYears +
+          Cause +
+          GCSTot +
+          CTComp,
+        data = B.ml_parto)
+
+table1( ~ Sex +
+          Age +
+          Race +
+          Mar +
+          EduYears +
+          Cause +
+          GCSTot +
+          CTComp,
+        data = H.ml_parto)
+```
+
+### 1. White patients
+
+#### 1.1. Configural
+
+Create the model
+
+```{r, message=FALSE}
+W.ml_mod1 = as.character(measEq.syntax(long.ml_mod,
+                                data = W.ml_parto,     
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long.ml_factors,
+                                long.equal = "configural")) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+W.ml_fit1 = cfa(W.ml_mod1,
+             data = W.ml_parto,
+             ordered = T, std.lv = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(W.ml_fit1, fit.measures = names_fit)
+```
+
+
+#### 1.2. Thresholds
+
+Create the model
+
+```{r, message=FALSE}
+W.ml_mod2 = as.character(measEq.syntax(long.ml_mod,
+                                data = W.ml_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long.ml_factors,
+                                long.equal = "thresholds")) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+W.ml_fit2 = cfa(W.ml_mod2,
+             data = W.ml_parto,
+             ordered = T, std.lv = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(W.ml_fit2, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(W.ml_fit1, W.ml_fit2)
+```
+
+#### 1.3. Loadings
+
+Create the model
+
+```{r, message=FALSE}
+W.ml_mod3 = as.character(measEq.syntax(long.ml_mod,
+                                data = W.ml_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long.ml_factors,
+                                long.equal = c("thresholds", "loadings"))) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+W.ml_fit3 = cfa(W.ml_mod3,
+             data = W.ml_parto,
+             ordered = T, std.lv = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(W.ml_fit3, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(W.ml_fit2, W.ml_fit3)
+```
+
+#### Full comparison
+
+Fit indices
+
+```{r}
+W.ml_MI <- rbind(
+  configural = fitmeasures(W.ml_fit1, fit.measures = names_fit),
+  threshold  = fitmeasures(W.ml_fit2, fit.measures = names_fit),
+  loading    = fitmeasures(W.ml_fit3, fit.measures = names_fit))
+
+W.ml_MI <- W.ml_MI %>%
+  cbind(., chisq_df = .[, "chisq.scaled"] / .[, "df.scaled"]) %>%
+  .[, c("chisq.scaled", "df.scaled", "chisq_df", "cfi.scaled", "rmsea.scaled",
+        "rmsea.ci.lower.scaled", "rmsea.ci.upper.scaled", "srmr")]
+
+W.ml_MI = round(W.ml_MI, 3)
+colnames(W.ml_MI) = names_short
+```
+
+Differences in fit indices
+
+```{r}
+W.ml_diff <- rbind(
+  conf_thres = fit_diff(W.ml_fit1, W.ml_fit2),
+  thres_load = fit_diff(W.ml_fit2, W.ml_fit3))
+```
+
+**All results**
+
+```{r}
+W.ml_results = list(MI = W.ml_MI,
+                     diff = W.ml_diff)
+W.ml_results
+```
+
+#### Remove objects
+
+```{r, eval=TRUE}
+rm(W.ml_parto)
+rm(W.ml_mod1, W.ml_mod2, W.ml_mod3)
+rm(W.ml_fit1, W.ml_fit2, W.ml_fit3)
+rm(W.ml_MI,   W.ml_diff)
+```
+
+### 2. Black patients
+
+#### 2.1. Configural
+
+Create the model
+
+```{r, message=FALSE}
+B.ml_mod1 = as.character(measEq.syntax(long.ml_mod,
+                                data = B.ml_parto,     
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long.ml_factors,
+                                long.equal = "configural")) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+B.ml_fit1 = cfa(B.ml_mod1,
+             data = B.ml_parto,
+             ordered = T, std.lv = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(B.ml_fit1, fit.measures = names_fit)
+```
+
+
+#### 2.2. Thresholds
+
+Create the model
+
+```{r, message=FALSE}
+B.ml_mod2 = as.character(measEq.syntax(long.ml_mod,
+                                data = B.ml_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long.ml_factors,
+                                long.equal = "thresholds")) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+B.ml_fit2 = cfa(B.ml_mod2,
+             data = B.ml_parto,
+             ordered = T, std.lv = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(B.ml_fit2, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(B.ml_fit1, B.ml_fit2)
+```
+
+#### 2.3. Loadings
+
+Create the model
+
+```{r, message=FALSE}
+B.ml_mod3 = as.character(measEq.syntax(long.ml_mod,
+                                data = B.ml_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long.ml_factors,
+                                long.equal = c("thresholds", "loadings"))) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+B.ml_fit3 = cfa(B.ml_mod3,
+             data = B.ml_parto,
+             ordered = T, std.lv = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(B.ml_fit3, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(B.ml_fit2, B.ml_fit3)
+```
+
+#### Full comparison
+
+Fit indices
+
+```{r}
+B.ml_MI <- rbind(
+  configural = fitmeasures(B.ml_fit1, fit.measures = names_fit),
+  threshold  = fitmeasures(B.ml_fit2, fit.measures = names_fit),
+  loading    = fitmeasures(B.ml_fit3, fit.measures = names_fit))
+
+B.ml_MI <- B.ml_MI %>%
+  cbind(., chisq_df = .[, "chisq.scaled"] / .[, "df.scaled"]) %>%
+  .[, c("chisq.scaled", "df.scaled", "chisq_df", "cfi.scaled", "rmsea.scaled",
+        "rmsea.ci.lower.scaled", "rmsea.ci.upper.scaled", "srmr")]
+
+B.ml_MI = round(B.ml_MI, 3)
+colnames(B.ml_MI) = names_short
+```
+
+Differences in fit indices
+
+```{r}
+B.ml_diff <- rbind(
+  conf_thres = fit_diff(B.ml_fit1, B.ml_fit2),
+  thres_load = fit_diff(B.ml_fit2, B.ml_fit3))
+```
+
+**All results**
+
+```{r}
+B.ml_results = list(MI = B.ml_MI,
+                     diff = B.ml_diff)
+B.ml_results
+```
+
+#### Remove objects
+
+```{r, eval=TRUE}
+rm(B.ml_parto)
+rm(B.ml_mod1, B.ml_mod2, B.ml_mod3)
+rm(B.ml_fit1, B.ml_fit2, B.ml_fit3)
+rm(B.ml_MI,   B.ml_diff)
+```
+
+
+### 3. Hispanic patients
+
+#### 2.1. Configural
+
+Create the model
+
+```{r}
+H.ml_mod1 = as.character(measEq.syntax(long.ml_mod,
+                                data = H.ml_parto,     
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long.ml_factors,
+                                long.equal = "configural")) 
+```
+
+Fit the model
+
+```{r}
+H.ml_fit1 = cfa(H.ml_mod1,
+             data = H.ml_parto,
+             ordered = T, std.lv = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(H.ml_fit1, fit.measures = names_fit)
+```
+
+
+#### 2.2. Thresholds
+
+Create the model
+
+```{r, message=FALSE}
+H.ml_mod2 = as.character(measEq.syntax(long.ml_mod,
+                                data = H.ml_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long.ml_factors,
+                                long.equal = "thresholds")) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+H.ml_fit2 = cfa(H.ml_mod2,
+             data = H.ml_parto,
+             ordered = T, std.lv = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(H.ml_fit2, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(H.ml_fit1, H.ml_fit2)
+```
+
+#### 2.3. Loadings
+
+Create the model
+
+```{r, message=FALSE}
+H.ml_mod3 = as.character(measEq.syntax(long.ml_mod,
+                                data = H.ml_parto,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long.ml_factors,
+                                long.equal = c("thresholds", "loadings"))) 
+```
+
+Fit the model
+
+```{r, message=FALSE}
+H.ml_fit3 = cfa(H.ml_mod3,
+             data = H.ml_parto,
+             ordered = T, std.lv = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(H.ml_fit3, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(H.ml_fit2, H.ml_fit3)
+```
+
+#### Full comparison
+
+Fit indices
+
+```{r}
+H.ml_MI <- rbind(
+  configural = fitmeasures(H.ml_fit1, fit.measures = names_fit),
+  threshold  = fitmeasures(H.ml_fit2, fit.measures = names_fit),
+  loading    = fitmeasures(H.ml_fit3, fit.measures = names_fit))
+
+H.ml_MI <- H.ml_MI %>%
+  cbind(., chisq_df = .[, "chisq.scaled"] / .[, "df.scaled"]) %>%
+  .[, c("chisq.scaled", "df.scaled", "chisq_df", "cfi.scaled", "rmsea.scaled",
+        "rmsea.ci.lower.scaled", "rmsea.ci.upper.scaled", "srmr")]
+
+H.ml_MI = round(H.ml_MI, 3)
+colnames(H.ml_MI) = names_short
+```
+
+Differences in fit indices
+
+```{r}
+H.ml_diff <- rbind(
+  conf_thres = fit_diff(H.ml_fit1, H.ml_fit2),
+  thres_load = fit_diff(H.ml_fit2, H.ml_fit3))
+```
+
+**All results**
+
+```{r}
+H.ml_results = list(MI = H.ml_MI,
+                     diff = H.ml_diff)
+H.ml_results
+```
+
+#### Remove objects
+
+```{r, eval=TRUE}
+rm(H.ml_parto)
+rm(H.ml_mod1, H.ml_mod2, H.ml_mod3)
+rm(H.ml_fit1, H.ml_fit2, H.ml_fit3)
+rm(H.ml_MI,   H.ml_diff)
+rm(long.ml_mod, long.ml_factors)
+```
+
+## Export results
+
+Descriptive
+
+```{r, eval=FALSE}
+writeLines(paste(
+    "<h2>Full sample</h2>",
+    as.character(Rdesc),
+    "<h2>White subsample</h2>",
+    as.character(Wdesc),
+    "<h2>Black subsample</h2>",
+    as.character(Bdesc),
+    "<h2>Hispanic subsample</h2>",
+    as.character(Hdesc)),
+  "data/descriptivesLong.html")
+```
+
+Fit indices
+
+```{r, eval=FALSE}
+library(writexl)
+toexcel <- \(x) data.frame(model = rownames(x), x, check.names = FALSE)
+
+write_xlsx(list(
+  MI   = toexcel(R.ml_results$MI),
+  diff = toexcel(R.ml_results$diff)),
+  "data/fullsample_results.xlsx")
+
+write_xlsx(list(
+  W_MI   = toexcel(W.ml_results$MI),
+  W_diff = toexcel(W.ml_results$diff),
+  B_MI   = toexcel(B.ml_results$MI),
+  B_diff = toexcel(B.ml_results$diff),
+  H_MI   = toexcel(H.ml_results$MI),
+  H_diff = toexcel(H.ml_results$diff)),
+  "data/pergroup_results.xlsx")
+```
+
+
