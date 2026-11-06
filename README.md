@@ -1,10 +1,12 @@
-# SWLS_Measurement_Invariance
-Measurement Invariance analysis of the Satisfaction With Life Scale (SWLS), with data from the Traumatic Brain Injury Model System (TBIMS)
+# Measurement_Invariance
+Measurement Invariance analysis of various tests, with data from the Traumatic Brain Injury Model System (TBIMS)
 
-The file contains the following sections:
- I. Data preparation: Initial clean and selection from the TBIMS data.
- II. Cross-sectional MI: Measurement invariance analyses at each selected timepoint.
- III. Longitudinal MI: Measurement invariance for the full sample, longitudinally.
- IV. Sensitivity analysis: Longitudinal measurement invariance for each racial/ethnic group.
+So far, these are the available tests:
+ - SWLS (Satisfaction With Life Scale)
+ - PART-O (Participation Assessment with Recombined Tools - Objective)
+
+These are upcoming tests:
+ - GAD-7 (Generalized Anxiety Disorder-7)
+ - Functional Independence Measure (FIM)
 
 Data from the TBIMS would be required to replicate the results.
