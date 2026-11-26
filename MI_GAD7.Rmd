@@ -1,0 +1,1985 @@
+---
+title: "GAD-7 Measurement Invariance"
+author: "Sylver Yllanes-Lizarraga"
+
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    self_contained: true
+  pdf_document:
+    toc: true
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Libraries
+
+```{r, message=FALSE, warning=FALSE}
+library(haven)
+library(stringr)
+library(dplyr)
+library(table1)
+library(openxlsx)
+
+library(lavaan)
+library(semTools)
+
+library(tidyr)
+library(purrr)
+
+library(lme4)
+library(lmerTest)
+library(leaps)
+library(ggeffects)
+library(ggplot2)
+library(sjPlot)
+```
+
+# Auxiliary functions
+
+**Differences in fit**
+
+`fit_diff()`, to summarize the differences between invariance levels
+
+```{r}
+fit_diff <- function(fit1, fit2) {
+  lrt <- lavTestLRT(fit1, fit2)
+  data.frame(D.chisq = round(lrt$`Chisq diff`[2], 2),
+             D.df = lrt$`Df diff`[2],
+             pvalue = signif(lrt$`Pr(>Chisq)`[2], 3),
+             D.cfi = round(unname(fitMeasures(fit2, "cfi.scaled") -
+                                   fitMeasures(fit1, "cfi.scaled")), 3),
+             D.rmsea = round(unname(fitMeasures(fit2, "rmsea.scaled") -
+                                     fitMeasures(fit1, "rmsea.scaled")), 3))}
+```
+
+`plot_pred()`, to create our plots more easily
+
+```{r}
+plot_pred <- function(model, term, by = NULL, type = c("auto", "line", "point"),
+                      ci_level = NULL, ylim = NULL, x_back = NULL,
+                      x_lab = NULL, y_lab = NULL, title = NULL) {
+  type <- match.arg(type)
+  ci <- length(ci_level) > 0 && !is.na(ci_level)
+  d <- as.data.frame(ggpredict(model, c(term, by),
+                               ci_level = if (ci) ci_level else NA))
+  if (!is.null(x_back)) d$x <- d$x * x_back[2] + x_back[1]   # <- new
+  if (type == "auto") type <- if (is.numeric(d$x)) "line" else "point"
+  dodge <- position_dodge(.4)
+  ci_aes <- aes(ymin = conf.low, ymax = conf.high)
+
+  ggplot(d, aes(x, predicted, group = group)) +
+    (if (!is.null(by)) aes(shape = group, linetype = group)) +
+    switch(type,
+           line  = list(if (ci) geom_ribbon(ci_aes, alpha = .15, colour = NA),
+                        geom_line(linewidth = .7)),
+           point = list(if (ci) geom_errorbar(ci_aes, width = .15,
+                                              position = dodge),
+                        geom_point(size = 2.5, position = dodge))) +
+    scale_y_continuous(limits = ylim) +
+    labs(x = x_lab, y = y_lab, title = title, shape = by, linetype = by) +
+    theme_bw()}
+```
+
+`save_grid()`, to save our plot grids
+
+```{r}
+save_grid <- function(plots, file, ncol = 2,
+                      total_width = 8, panel_height = 2.75, tags = TRUE)
+  {ggsave(file,
+        cowplot::plot_grid(plotlist = plots,
+                            ncol = ncol, align = "hv",
+                            labels = if (tags) "AUTO" else NULL),
+        width  = total_width,
+        height = ceiling(length(plots)/ncol) * panel_height,
+        dpi = 600) }
+```
+
+
+# I. Data preparation
+
+## 1. Import the data
+
+```{r}
+d0 = read_sav("TBIMS_cleaned.sav") %>%
+  mutate(across(1:26 & where(haven::is.labelled), haven::as_factor),
+         across(-(1:26), \(x) { attributes(x) = NULL; x }) ) %>%
+  haven::zap_formats()
+```
+
+Keep sociodemographic and test variables (excluding "GADDifficult" and "GAD7TOT", as they're not raw items)
+
+```{r}
+gad0 = d0 %>%
+  select(UID, Age, Race, Sex, Mar, EduYears,
+         Cause, CTComp, GCSTot,
+         matches("^GAD", ignore.case=FALSE),
+         -matches("GADDifficult|GAD7TOT"))
+```
+
+Recode items into Not at all (0), Several days (1), More than half the days (2), Nearly every day (3), and NA (6, 9, 10 and NA)
+
+
+```{r}
+gad0 <- gad0 %>%
+  mutate(across(
+    matches("GAD"),
+    ~ ordered (ifelse(.x > 3, NA, .x),
+               levels = c(0,1,2,3),
+               labels = c("not at all", "several days",
+                          "more than half the days", "nearly every day"))))
+```
+
+## 2. Remove missing data
+
+Create columns for missing data
+
+```{r}
+gad0 <- gad0 %>%
+  mutate(
+    missing_T1 = rowSums(across(contains("GAD") & ends_with(".1"), is.na)),
+    missing_T2 = rowSums(across(contains("GAD") & ends_with(".2"), is.na)),
+    missing_T3 = rowSums(across(contains("GAD") & ends_with(".3"), is.na)),
+    missing_T4 = rowSums(across(contains("GAD") & ends_with(".4"), is.na)),
+    missing_T5 = rowSums(across(contains("GAD") & ends_with(".5"), is.na)),
+    missing_T6 = rowSums(across(contains("GAD") & ends_with(".6"), is.na)),
+    missing_T7 = rowSums(across(contains("GAD") & ends_with(".7"), is.na)) )
+```
+
+Cross-sectional: complete data for each timepoint (divided by race)
+
+```{r}
+gad0 %>%
+  group_by(Race) %>%
+  summarise(
+    n = n(),
+    timepoint_1 = sum(missing_T1 == 0, na.rm = TRUE),
+    timepoint_2 = sum(missing_T2 == 0, na.rm = TRUE),
+    timepoint_3 = sum(missing_T3 == 0, na.rm = TRUE),
+    timepoint_4 = sum(missing_T4 == 0, na.rm = TRUE),
+    timepoint_5 = sum(missing_T5 == 0, na.rm = TRUE),
+    timepoint_6 = sum(missing_T6 == 0, na.rm = TRUE),
+    timepoint_7 = sum(missing_T7 == 0, na.rm = TRUE)) %>%
+  arrange(desc(n))
+```
+
+- Available cross-sectional data:
+  - White and Black patients
+  - Timepoints 1, 2, 3 and 4
+  - Lowest n=237
+
+Longitudinal: complete data for each race (divided by T1, T1+2...)
+
+```{r}
+gad0 %>%
+  group_by(Race) %>%
+  summarise(
+    n = n(),
+    timepoint_1 = sum(missing_T1 == 0, na.rm = TRUE),
+    timepoint_1_2 = sum(missing_T1 == 0 & missing_T2 == 0, na.rm = TRUE),
+    timepoint_1_2_3 = sum(missing_T1 == 0 & missing_T2 == 0 & missing_T3 == 0, na.rm = TRUE),
+    timepoint_1_2_3_4 = sum(missing_T1 == 0 & missing_T2 == 0 & missing_T3 == 0 & missing_T4 == 0, na.rm = TRUE) ) %>%
+  arrange(desc(n))
+```
+
+- Available longitudinal data:
+  -   White patients
+  -   Timepoints 1 and 2
+  -   Lowest n=808
+
+**Final dataset**
+
+```{r}
+gad7 = gad0 %>%
+  filter(Race %in% c("White", "Black", "Hispanic Orgin")) %>%
+  select(1:9,
+         matches("\\.[12]$")) %>%
+  mutate(Race = droplevels(Race))
+nrow(gad7)
+```
+
+## 3. Final prep
+
+Create vectors with fit indices names
+
+```{r}
+names_fit = c("chisq.scaled", "df.scaled", "cfi.scaled",
+              "rmsea.scaled", "rmsea.ci.lower.scaled",
+              "rmsea.ci.upper.scaled", "srmr")
+
+names_short = c("chisq", "df", "chisq/df", "cfi", "rmsea",
+                "ci.lower", "ci.upper", "srmr")
+```
+
+Remove unnecessary objects
+
+```{r}
+rm(d0, gad0)
+```
+
+## Proportions per timepoint
+
+```{r}
+proportions = gad7 %>%
+  select(matches("^GAD.+\\.[12]$")) %>%
+  pivot_longer(everything(), names_to = c("item", "timepoint"),
+               names_sep = "\\.", values_to = "response") %>%
+  drop_na(response) %>%
+  count(item, timepoint, response, .drop = FALSE) %>%
+  group_by(item, timepoint) %>%
+  mutate(prop = round(n / sum(n), 2)) %>%
+  ungroup() %>%
+  pivot_wider(id_cols = item, names_from = c(response, timepoint),
+              values_from = prop, names_sort = TRUE)
+```
+
+
+# II. Cross-sectional MI
+
+## 1. One year after TBI
+
+Create the sub-dataset
+
+```{r}
+T1_gad7 <- gad7 %>%
+  filter(Race %in% c("White", "Black", "Hispanic Orgin"),
+         if_all(matches("GAD.*\\.1$"), ~ !is.na(.)) ) %>%
+  select(1:9,
+         matches("GAD.*\\.1$"))
+nrow(T1_gad7)
+```
+
+Create the model
+
+```{r}
+T1_mod = 'Anxiety =~ GADNervous.1 +
+                     GADCntrlWry.1 +
+                     GADWorry.1 +
+                     GADRelax.1 +
+                     GADRestless.1 +
+                     GADAnnoy.1 +
+                     GADAfraid.1'
+```
+
+**Descriptive statistics**
+
+```{r}
+T1desc = table1( ~ Sex +
+          Age +
+          Race +
+          Mar +
+          EduYears +
+          Cause +
+          GCSTot +
+          CTComp,
+        data = T1_gad7)
+T1desc
+```
+
+### 1.1. Configural
+
+Create the model
+
+```{r, message=FALSE}
+T1_mod1 = as.character(measEq.syntax(T1_mod,
+                                data = T1_gad7,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "configural")) 
+#cat(as.character(T1_mod1))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T1_fit1 = cfa(T1_mod1,
+              data = T1_gad7,
+              ordered = T,
+              group = "Race")
+#summary(T1_fit1, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T1_fit1, fit.measures = names_fit)
+```
+
+### 1.2. Thresholds
+
+Create the model
+
+```{r, message=FALSE}
+T1_mod2 = as.character(measEq.syntax(T1_mod,
+                                data = T1_gad7,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "thresholds")) 
+#cat(as.character(T1_mod2))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T1_fit2 = cfa(T1_mod2,
+              data = T1_gad7,
+              ordered = T,
+              group = "Race")
+#summary(T1_fit2, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T1_fit2, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(T1_fit1, T1_fit2)
+```
+
+### 1.3. Loadings
+
+Create the model
+
+```{r, message=FALSE}
+T1_mod3 = as.character(measEq.syntax(T1_mod,
+                                data = T1_gad7,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = c("thresholds", "loadings"))) 
+#cat(as.character(T1_mod3))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T1_fit3 = cfa(T1_mod3,
+              data = T1_gad7,
+              ordered = T,
+              group = "Race")
+#summary(T1_fit3, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T1_fit3, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(T1_fit2, T1_fit3)
+```
+
+### 1.4. Intercept
+
+Create the model
+
+```{r, message=FALSE}
+T1_mod4 = as.character(measEq.syntax(T1_mod,
+                                data = T1_gad7,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = c("thresholds", "loadings",
+                                                "intercepts"))) 
+#cat(as.character(T1_mod4))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T1_fit4 = cfa(T1_mod4,
+              data = T1_gad7,
+              ordered = T,
+              group = "Race")
+#summary(T1_fit4, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T1_fit4, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(T1_fit3, T1_fit4)
+```
+
+
+### Full comparison
+
+Fit indices
+
+```{r}
+MI_T1 <- rbind(
+  configural = fitmeasures(T1_fit1, fit.measures = names_fit),
+  threshold  = fitmeasures(T1_fit2, fit.measures = names_fit),
+  loading    = fitmeasures(T1_fit3, fit.measures = names_fit),
+  intercept  = fitmeasures(T1_fit4, fit.measures = names_fit))
+
+MI_T1 <- MI_T1 %>%
+  cbind(., chisq_df = .[, "chisq.scaled"] / .[, "df.scaled"]) %>%
+  .[, c("chisq.scaled", "df.scaled", "chisq_df", "cfi.scaled", "rmsea.scaled",
+        "rmsea.ci.lower.scaled", "rmsea.ci.upper.scaled", "srmr")]
+
+MI_T1 = round(MI_T1, 3)
+colnames(MI_T1) = names_short
+```
+
+Differences in fit indices
+
+```{r}
+diff_T1 <- rbind(
+  conf_thres = fit_diff(T1_fit1, T1_fit2),
+  thres_load = fit_diff(T1_fit2, T1_fit3),
+  load_inter = fit_diff(T1_fit3, T1_fit4))
+```
+
+
+**All results**
+
+```{r}
+T1_results = list(MI = MI_T1,
+                  diff = diff_T1)
+
+round(T1_results$MI,3)
+round(T1_results$diff,4)
+```
+
+### Remove objects
+
+```{r}
+rm(T1_gad7, T1_mod)
+rm(T1_mod1, T1_mod2, T1_mod3, T1_mod4,
+   T1_fit1, T1_fit2, T1_fit3, T1_fit4)
+rm(MI_T1, diff_T1)
+```
+
+## 2. Two years after TBI
+
+Create the sub-dataset
+
+```{r}
+T2_gad7 <- gad7 %>%
+  filter(Race %in% c("White", "Black", "Hispanic Orgin"),
+         if_all(matches("GAD.*\\.2$"), ~ !is.na(.)) ) %>%
+  select(1:9,
+         matches("GAD.*\\.2$"))
+nrow(T2_gad7)
+```
+
+Create the model
+
+```{r}
+T2_mod = 'Anxiety =~ GADNervous.2 +
+                     GADCntrlWry.2 +
+                     GADWorry.2 +
+                     GADRelax.2 +
+                     GADRestless.2 +
+                     GADAnnoy.2 +
+                     GADAfraid.2'
+```
+
+**Descriptive statistics**
+
+```{r}
+T2desc = table1( ~ Sex +
+          Age +
+          Race +
+          Mar +
+          EduYears +
+          Cause +
+          GCSTot +
+          CTComp,
+        data = T2_gad7)
+T2desc
+```
+
+### 2.1. Configural
+
+Create the model
+
+```{r, message=FALSE}
+T2_mod1 = as.character(measEq.syntax(T2_mod,
+                                data = T2_gad7,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "configural")) 
+#cat(as.character(T2_mod1))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T2_fit1 = cfa(T2_mod1,
+              data = T2_gad7,
+              ordered = T,
+              group = "Race")
+#summary(T2_fit1, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T2_fit1, fit.measures = names_fit)
+```
+
+### 2.2. Thresholds
+
+Create the model
+
+```{r, message=FALSE}
+T2_mod2 = as.character(measEq.syntax(T2_mod,
+                                data = T2_gad7,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = "thresholds")) 
+#cat(as.character(T2_mod2))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T2_fit2 = cfa(T2_mod2,
+              data = T2_gad7,
+              ordered = T,
+              group = "Race")
+#summary(T2_fit2, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T2_fit2, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(T2_fit1, T2_fit2)
+```
+
+### 2.3. Loadings
+
+Create the model
+
+```{r, message=FALSE}
+T2_mod3 = as.character(measEq.syntax(T2_mod,
+                                data = T2_gad7,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = c("thresholds", "loadings"))) 
+#cat(as.character(T2_mod3))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T2_fit3 = cfa(T2_mod3,
+              data = T2_gad7,
+              ordered = T,
+              group = "Race")
+#summary(T2_fit3, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T2_fit3, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(T2_fit2, T2_fit3)
+```
+
+### 2.4. Intercept
+
+Create the model
+
+```{r, message=FALSE}
+T2_mod4 = as.character(measEq.syntax(T2_mod,
+                                data = T2_gad7,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                group = "Race",
+                                group.equal = c("thresholds", "loadings",
+                                                "intercepts"))) 
+#cat(as.character(T2_mod4))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+T2_fit4 = cfa(T2_mod4,
+              data = T2_gad7,
+              ordered = T,
+              group = "Race")
+#summary(T2_fit4, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(T2_fit4, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(T2_fit3, T2_fit4)
+```
+
+
+### Full comparison
+
+Fit indices
+
+```{r}
+MI_T2 <- rbind(
+  configural = fitmeasures(T2_fit1, fit.measures = names_fit),
+  threshold  = fitmeasures(T2_fit2, fit.measures = names_fit),
+  loading    = fitmeasures(T2_fit3, fit.measures = names_fit),
+  intercept  = fitmeasures(T2_fit4, fit.measures = names_fit))
+
+MI_T2 <- MI_T2 %>%
+  cbind(., chisq_df = .[, "chisq.scaled"] / .[, "df.scaled"]) %>%
+  .[, c("chisq.scaled", "df.scaled", "chisq_df", "cfi.scaled", "rmsea.scaled",
+        "rmsea.ci.lower.scaled", "rmsea.ci.upper.scaled", "srmr")]
+
+MI_T2 = round(MI_T2, 3)
+colnames(MI_T2) = names_short
+```
+
+Differences in fit indices
+
+```{r}
+diff_T2 <- rbind(
+  conf_thres = fit_diff(T2_fit1, T2_fit2),
+  thres_load = fit_diff(T2_fit2, T2_fit3),
+  load_inter = fit_diff(T2_fit3, T2_fit4))
+```
+
+
+**All results**
+
+```{r}
+T2_results = list(MI = MI_T2,
+                  diff = diff_T2)
+
+round(T2_results$MI,3)
+round(T2_results$diff,4)
+```
+
+### Remove objects
+
+```{r}
+rm(T2_gad7, T2_mod)
+rm(T2_mod1, T2_mod2, T2_mod3, T2_mod4,
+   T2_fit1, T2_fit2, T2_fit3, T2_fit4)
+rm(MI_T2, diff_T2)
+```
+
+
+## Export results
+
+```{r, eval=FALSE}
+library(writexl)
+```
+
+Descriptive (cross-sectional)
+
+```{r, eval=FALSE}
+writeLines(paste(
+    "<h2>Timepoint 1</h2>",
+    as.character(T1desc),
+    "<h2>Timepoint 2</h2>",
+    as.character(T2desc)),
+  "data/descriptivesCross.html")
+```
+
+Proportions
+
+```{r, eval=FALSE}
+write_xlsx(proportions, "data/proportiontables.xlsx")
+```
+
+Fit indices
+
+```{r, eval=FALSE}
+toexcel <- \(x) data.frame(model = rownames(x), x, check.names = FALSE)
+
+write_xlsx(list(
+  T1_MI   = toexcel(T1_results$MI),
+  T1_diff = toexcel(T1_results$diff),
+  T2_MI   = toexcel(T2_results$MI),
+  T2_diff = toexcel(T2_results$diff)),
+  "data/CrossMI_results.xlsx")
+```
+
+```{r}
+rm(T1desc, T2desc)
+rm(proportions)
+```
+
+
+# III. Longitudinal MI
+
+Create the model
+
+```{r}
+long_mod = 'T1.Anxiety =~ GADNervous.1 +
+                          GADCntrlWry.1 +
+                          GADWorry.1 +
+                          GADRelax.1 +
+                          GADRestless.1 +
+                          GADAnnoy.1 +
+                          GADAfraid.1
+            
+            T2.Anxiety =~ GADNervous.2 +
+                          GADCntrlWry.2 +
+                          GADWorry.2 +
+                          GADRelax.2 +
+                          GADRestless.2 +
+                          GADAnnoy.2 +
+                          GADAfraid.2'
+```
+
+Create factor correspondence
+
+```{r}
+long_factors = list(Anxiety = c("T1.Anxiety", "T2.Anxiety"))
+```
+
+Select complete data
+
+```{r}
+full_gad7 <- gad7 %>%
+  filter(if_all(matches("GAD.*\\.(1|2)$"), ~ !is.na(.)) ) %>%
+  select(1:9,
+         matches("GAD.*\\.(1|2)$"))
+nrow(full_gad7)
+```
+**Descriptive statistics**
+
+```{r}
+fulldesc = table1( ~ Sex +
+          Age +
+          Race +
+          Mar +
+          EduYears +
+          Cause +
+          GCSTot +
+          CTComp,
+        data = full_gad7)
+
+fulldesc
+```
+
+
+## 1. Configural
+
+Create the model
+
+```{r, message=FALSE}
+full_mod1 = as.character(measEq.syntax(long_mod,
+                                data = full_gad7,     
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016",
+                                longFacNames = long_factors,
+                                long.equal = "")) 
+#cat(as.character(full_mod1))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+full_fit1 = cfa(full_mod1,
+             data = full_gad7,
+             ordered = T, std.lv = T)
+#summary(full_fit1, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(full_fit1, fit.measures = names_fit)
+```
+
+## 2. Thresholds
+
+Create the model
+
+```{r, message=FALSE}
+full_mod2 = as.character(measEq.syntax(long_mod,
+                                data = full_gad7,     
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016",
+                                longFacNames = long_factors,
+                                long.equal = "thresholds")) 
+#cat(as.character(full_mod2))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+full_fit2 = cfa(full_mod2,
+             data = full_gad7,
+             ordered = T, std.lv = T)
+#summary(full_fit2, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(full_fit2, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(full_fit1, full_fit2)
+```
+
+## 3. Loadings
+
+Create the model
+
+```{r, message=FALSE}
+full_mod3 = as.character(measEq.syntax(long_mod,
+                                data = full_gad7,     
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016",
+                                longFacNames = long_factors,
+                                long.equal = c("thresholds", "loadings"))) 
+#cat(as.character(full_mod3))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+full_fit3 = cfa(full_mod3,
+             data = full_gad7,
+             ordered = T, std.lv = T)
+#summary(full_fit3, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(full_fit3, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(full_fit2, full_fit3)
+```
+
+## 4. Intercepts
+
+Create the model
+
+```{r, message=FALSE}
+full_mod4 = as.character(measEq.syntax(long_mod,
+                                data = full_gad7,     
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016",
+                                longFacNames = long_factors,
+                                long.equal = c("thresholds", "loadings",
+                                               "intercepts"))) 
+#cat(as.character(full_mod4))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+full_fit4 = cfa(full_mod4,
+             data = full_gad7,
+             ordered = T, std.lv = T)
+#summary(full_fit4, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(full_fit4, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(full_fit3, full_fit4)
+```
+
+## Full comparison
+
+Fit indices
+
+```{r}
+MI_full <- rbind(
+  configural = fitmeasures(full_fit1, fit.measures = names_fit),
+  threshold  = fitmeasures(full_fit2, fit.measures = names_fit),
+  loading    = fitmeasures(full_fit3, fit.measures = names_fit),
+  intercept  = fitmeasures(full_fit4, fit.measures = names_fit))
+
+MI_full <- MI_full %>%
+  cbind(., chisq_df = .[, "chisq.scaled"] / .[, "df.scaled"]) %>%
+  .[, c("chisq.scaled", "df.scaled", "chisq_df", "cfi.scaled", "rmsea.scaled",
+        "rmsea.ci.lower.scaled", "rmsea.ci.upper.scaled", "srmr")]
+
+MI_full = round(MI_full, 3)
+colnames(MI_full) = names_short
+```
+
+Differences in fit indices
+
+```{r}
+diff_full <- rbind(
+  conf_thres = fit_diff(full_fit1, full_fit2),
+  thres_load = fit_diff(full_fit2, full_fit3),
+  load_inter = fit_diff(full_fit3, full_fit4))
+```
+
+
+**All results**
+
+```{r}
+full_results = list(MI = MI_full,
+                  diff = diff_full)
+
+round(full_results$MI,3)
+round(full_results$diff,4)
+```
+
+## Factor scores
+
+Calculate factor scores
+
+```{r, eval=FALSE, message=FALSE, warning=FALSE}
+idx <- lavInspect(full_fit4, "case.idx")
+Anx_scores <- as.data.frame(lavPredict(full_fit4, type = "lv",
+                                       method = "EBM"))[order(idx), ]
+stopifnot(nrow(Anx_scores) == length(idx))
+full_gad7[sort(idx), names(Anx_scores)] <- Anx_scores
+
+saveRDS(Anx_scores, "data/Anx_scores.rds")
+```
+
+```{r}
+Anx_scores <- readRDS("data/Anx_scores.rds")
+```
+
+Format the information
+
+```{r}
+Anx_combined <- full_gad7 %>%
+  select(1:9) %>%
+  bind_cols(Anx_scores)
+
+Anx_combined <- Anx_combined %>%
+  pivot_longer(
+    cols = matches("^T\\d\\.Anxiety$"),
+    names_to = c("Timepoint", ".value"),
+    names_pattern = "T(\\d)\\.(Anxiety)")
+```
+
+**Other fixes**
+
+Keep only cases with complete data
+
+```{r}
+nrow(Anx_combined)
+
+Anx_Fscores <- Anx_combined %>%
+  # Remove missing data
+  filter(complete.cases(.)) %>%
+  # Re-order variables
+  select(UID, Age, Race, Sex, Mar, EduYears,
+         GCSTot, CTComp, Cause, Timepoint, Anxiety)
+
+nrow(Anx_Fscores)
+```
+Check and fix sparsity
+
+```{r}
+sapply(Anx_Fscores[,3:9], summary, useNA="ifany")
+```
+
+```{r}
+table(Anx_Fscores$Mar, useNA="ifany")
+
+Anx_Fscores <- Anx_Fscores %>%
+  mutate(
+    Mar = case_when(
+      Mar %in% c("Single (Never Married)") ~ "Single (Never Married)",
+      Mar %in% c("Married") ~ "Married",
+      Mar %in% c("Divorced") ~ "Divorced",
+      Mar %in% c("Widowed") ~ "Widowed",
+      Mar %in% c("Separated", "Cohabitation", "Other") ~ "Other",
+      TRUE ~ NA),
+    Mar = factor(Mar, levels = c("Single (Never Married)", "Married",
+                                 "Divorced", "Widowed", "Other")))
+
+table(Anx_Fscores$Mar, useNA="ifany")
+```
+Format variables as prefered
+
+```{r}
+Anx_Fscores <- Anx_Fscores %>%
+  mutate(
+    Race = factor(Race, labels = c("White", "Black", "Hispanic")),
+    Mar = factor(Mar, labels = c("Sin", "Mar", "Div", "Wid", "Oth")),
+    EduYears = factor(EduYears, labels = c("Up to 12", "12+")),
+    GCSTot = factor(GCSTot, labels = c("Mild", "Moderate", "Severe")),
+    CTComp = factor(CTComp, labels = c("No abn", "Visible abn")),
+    Cause = factor(Cause, labels = c("RTA", "Vio", "Spo", "Fal", "Ped")),
+    Timepoint = factor(Timepoint, labels = c("T1", "T2")))
+```
+
+## Remove objects
+
+```{r}
+rm(long_mod, long_factors)
+rm(full_mod1, full_mod2, full_mod3, full_mod4,
+   full_fit1, full_fit2, full_fit3, full_fit4)
+rm(MI_full, diff_full)
+
+rm(Anx_scores, Anx_combined,
+   idx, fs, g)
+```
+
+# IV. Sensitivity analysis
+
+Create the model
+
+```{r}
+long_mod = 'T1.Anxiety =~ GADNervous.1 +
+                          GADCntrlWry.1 +
+                          GADWorry.1 +
+                          GADRelax.1 +
+                          GADRestless.1 +
+                          GADAnnoy.1 +
+                          GADAfraid.1
+            
+            T2.Anxiety =~ GADNervous.2 +
+                          GADCntrlWry.2 +
+                          GADWorry.2 +
+                          GADRelax.2 +
+                          GADRestless.2 +
+                          GADAnnoy.2 +
+                          GADAfraid.2'
+```
+
+Create factor correspondence
+
+```{r}
+long_factors = list(Anxiety = c("T1.Anxiety", "T2.Anxiety"))
+```
+
+## 1. White patients
+
+```{r}
+W_gad7 <- gad7 %>%
+  filter(Race %in% c("White"),
+         if_all(matches("GAD.*\\.(1|2)$"), ~ !is.na(.)) ) %>%
+  select(1:9,
+         matches("GAD.*\\.(1|2)$"))
+nrow(W_gad7)
+```
+
+### 1.1. Configural
+
+Create the model
+
+```{r, message=FALSE}
+W_mod1 = as.character(measEq.syntax(long_mod,
+                                data = W_gad7,     
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long_factors,
+                                long.equal = "configural")) 
+#cat(as.character(W_mod1))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+W_fit1 = cfa(W_mod1,
+             data = W_gad7,
+             ordered = T, std.lv = T)
+#summary(W_fit1, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(W_fit1, fit.measures = names_fit)
+```
+
+### 1.2. Thresholds
+
+Create the model
+
+```{r, message=FALSE}
+W_mod2 = as.character(measEq.syntax(long_mod,
+                                data = W_gad7,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long_factors,
+                                long.equal = "thresholds")) 
+#cat(as.character(W_mod2))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+W_fit2 = cfa(W_mod2,
+             data = W_gad7,
+             ordered = T, std.lv = T)
+#summary(W_fit2, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(W_fit2, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(W_fit1, W_fit2)
+```
+
+### 1.3. Loadings
+
+Create the model
+
+```{r, message=FALSE}
+W_mod3 = as.character(measEq.syntax(long_mod,
+                                data = W_gad7,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long_factors,
+                                long.equal = c("thresholds", "loadings"))) 
+#cat(as.character(W_mod3))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+W_fit3 = cfa(W_mod3,
+             data = W_gad7,
+             ordered = T, std.lv = T)
+#summary(W_fit3, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(W_fit3, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(W_fit2, W_fit3)
+```
+
+
+### 1.4. Intercepts
+
+Create the model
+
+```{r, message=FALSE}
+W_mod4 = as.character(measEq.syntax(long_mod,
+                                data = W_gad7,     
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016",
+                                longFacNames = long_factors,
+                                long.equal = c("thresholds", "loadings",
+                                               "intercepts"))) 
+#cat(as.character(W_mod4))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+W_fit4 = cfa(W_mod4,
+             data = W_gad7,
+             ordered = T,
+             group = "Race")
+#summary(W_fit4, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(W_fit4, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(W_fit3, W_fit4)
+```
+
+### Full comparison
+
+Fit indices
+
+```{r}
+MI_W <- rbind(
+  configural = fitmeasures(W_fit1, fit.measures = names_fit),
+  threshold  = fitmeasures(W_fit2, fit.measures = names_fit),
+  loading    = fitmeasures(W_fit3, fit.measures = names_fit),
+  intercept  = fitmeasures(W_fit4, fit.measures = names_fit))
+
+MI_W <- MI_W %>%
+  cbind(., chisq_df = .[, "chisq.scaled"] / .[, "df.scaled"]) %>%
+  .[, c("chisq.scaled", "df.scaled", "chisq_df", "cfi.scaled", "rmsea.scaled",
+        "rmsea.ci.lower.scaled", "rmsea.ci.upper.scaled", "srmr")]
+
+MI_W = round(MI_W, 3)
+colnames(MI_W) = names_short
+```
+
+Differences in fit indices
+
+```{r}
+diff_W <- rbind(
+  conf_thres = fit_diff(W_fit1, W_fit2),
+  thres_load = fit_diff(W_fit2, W_fit3),
+  load_inter = fit_diff(W_fit3, W_fit4))
+```
+
+
+**All results**
+
+```{r}
+W_results = list(MI = MI_W,
+                  diff = diff_W)
+
+round(W_results$MI,3)
+round(W_results$diff,4)
+```
+
+### Remove objects
+
+```{r}
+rm(W_gad7)
+rm(W_mod1, W_mod2, W_mod3, W_mod4,
+   W_fit1, W_fit2, W_fit3, W_fit4)
+rm(MI_W, diff_W)
+```
+
+## 2. Black patients
+
+```{r}
+B_gad7 <- gad7 %>%
+  filter(Race %in% c("Black"),
+         if_all(matches("GAD.*\\.(1|2)$"), ~ !is.na(.)) ) %>%
+  select(1:9,
+         matches("GAD.*\\.(1|2)$"))
+nrow(B_gad7)
+```
+
+### 2.1. Configural
+
+Create the model
+
+```{r, message=FALSE}
+B_mod1 = as.character(measEq.syntax(long_mod,
+                                data = B_gad7,     
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long_factors,
+                                long.equal = "configural")) 
+#cat(as.character(B_mod1))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+B_fit1 = cfa(B_mod1,
+             data = B_gad7,
+             ordered = T, std.lv = T)
+#summary(H_fit1, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(B_fit1, fit.measures = names_fit)
+```
+
+### 2.2. Thresholds
+
+Create the model
+
+```{r, message=FALSE}
+B_mod2 = as.character(measEq.syntax(long_mod,
+                                data = B_gad7,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long_factors,
+                                long.equal = "thresholds")) 
+#cat(as.character(B_mod2))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+B_fit2 = cfa(B_mod2,
+             data = B_gad7,
+             ordered = T, std.lv = T)
+#summary(B_fit2, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(B_fit2, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(B_fit1, B_fit2)
+```
+
+### 2.3. Loadings
+
+Create the model
+
+```{r, message=FALSE}
+B_mod3 = as.character(measEq.syntax(long_mod,
+                                data = B_gad7,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long_factors,
+                                long.equal = c("thresholds", "loadings"))) 
+#cat(as.character(B_mod3))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+B_fit3 = cfa(B_mod3,
+             data = B_gad7,
+             ordered = T, std.lv = T)
+#summary(B_fit3, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(B_fit3, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(B_fit2, B_fit3)
+```
+
+### 2.4. Intercepts
+
+Create the model
+
+```{r, message=FALSE}
+B_mod4 = as.character(measEq.syntax(long_mod,
+                                data = B_gad7,     
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016",
+                                longFacNames = long_factors,
+                                long.equal = c("thresholds", "loadings",
+                                               "intercepts"))) 
+#cat(as.character(B_mod4))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+B_fit4 = cfa(B_mod4,
+             data = B_gad7,
+             ordered = T,
+             group = "Race")
+#summary(B_fit4, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(B_fit4, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(B_fit3, B_fit4)
+```
+
+### Full comparison
+
+Fit indices
+
+```{r}
+MI_B <- rbind(
+  configural = fitmeasures(B_fit1, fit.measures = names_fit),
+  threshold  = fitmeasures(B_fit2, fit.measures = names_fit),
+  loading    = fitmeasures(B_fit3, fit.measures = names_fit),
+  intercept  = fitmeasures(B_fit4, fit.measures = names_fit))
+
+MI_B <- MI_B %>%
+  cbind(., chisq_df = .[, "chisq.scaled"] / .[, "df.scaled"]) %>%
+  .[, c("chisq.scaled", "df.scaled", "chisq_df", "cfi.scaled", "rmsea.scaled",
+        "rmsea.ci.lower.scaled", "rmsea.ci.upper.scaled", "srmr")]
+
+MI_B = round(MI_B, 3)
+colnames(MI_B) = names_short
+```
+
+Differences in fit indices
+
+```{r}
+diff_B <- rbind(
+  conf_thres = fit_diff(B_fit1, B_fit2),
+  thres_load = fit_diff(B_fit2, B_fit3),
+  load_inter = fit_diff(B_fit3, B_fit4))
+```
+
+
+**All results**
+
+```{r}
+B_results = list(MI = MI_B,
+                  diff = diff_B)
+
+round(B_results$MI,3)
+round(B_results$diff,4)
+```
+
+### Remove objects
+
+```{r}
+rm(B_gad7)
+rm(B_mod1, B_mod2, B_mod3, B_mod4,
+   B_fit1, B_fit2, B_fit3, B_fit4)
+rm(MI_B, diff_B)
+```
+
+
+## 3. Hispanic patients
+
+```{r}
+H_gad7 <- gad7 %>%
+  filter(Race %in% c("Hispanic Orgin"),
+         if_all(matches("GAD.*\\.(1|2)$"), ~ !is.na(.)) ) %>%
+  select(1:9,
+         matches("GAD.*\\.(1|2)$"))
+nrow(H_gad7)
+```
+
+### 3.1. Configural
+
+Create the model
+
+```{r, message=FALSE}
+H_mod1 = as.character(measEq.syntax(long_mod,
+                                data = H_gad7,     
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long_factors,
+                                long.equal = "configural")) 
+#cat(as.character(H_mod1))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+H_fit1 = cfa(H_mod1,
+             data = H_gad7,
+             ordered = T, std.lv = T)
+#summary(H_fit1, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(H_fit1, fit.measures = names_fit)
+```
+
+### 3.2. Thresholds
+
+Create the model
+
+```{r, message=FALSE}
+H_mod2 = as.character(measEq.syntax(long_mod,
+                                data = H_gad7,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long_factors,
+                                long.equal = "thresholds")) 
+#cat(as.character(H_mod2))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+H_fit2 = cfa(H_mod2,
+             data = H_gad7,
+             ordered = T, std.lv = T)
+#summary(H_fit2, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(H_fit2, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(H_fit1, H_fit2)
+```
+
+### 3.3. Loadings
+
+Create the model
+
+```{r, message=FALSE}
+H_mod3 = as.character(measEq.syntax(long_mod,
+                                data = H_gad7,         
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016", 
+                                longFacNames = long_factors,
+                                long.equal = c("thresholds", "loadings"))) 
+#cat(as.character(H_mod3))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+H_fit3 = cfa(H_mod3,
+             data = H_gad7,
+             ordered = T, std.lv = T)
+#summary(H_fit3, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(H_fit3, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(H_fit2, H_fit3)
+```
+
+### 3.4. Intercepts
+
+Create the model
+
+```{r, message=FALSE}
+H_mod4 = as.character(measEq.syntax(long_mod,
+                                data = H_gad7,     
+                                ordered = T,           
+                                parameterization = "delta",   
+                                ID.fac = "std.lv",            
+                                ID.cat = "Wu.Estabrook.2016",
+                                longFacNames = long_factors,
+                                long.equal = c("thresholds", "loadings",
+                                               "intercepts"))) 
+#cat(as.character(H_mod4))
+```
+
+Fit the model
+
+```{r, message=FALSE}
+H_fit4 = cfa(H_mod4,
+             data = H_gad7,
+             ordered = T,
+             group = "Race")
+#summary(H_fit4, fit.measures = T)
+```
+
+Check fit measures
+
+```{r}
+fitMeasures(H_fit4, fit.measures = names_fit)
+```
+
+**Comparison**
+
+```{r}
+lavTestLRT(H_fit3, H_fit4)
+```
+
+### Full comparison
+
+Fit indices
+
+```{r}
+MI_H <- rbind(
+  configural = fitmeasures(H_fit1, fit.measures = names_fit),
+  threshold  = fitmeasures(H_fit2, fit.measures = names_fit),
+  loading    = fitmeasures(H_fit3, fit.measures = names_fit),
+  intercept  = fitmeasures(H_fit4, fit.measures = names_fit))
+
+MI_H <- MI_H %>%
+  cbind(., chisq_df = .[, "chisq.scaled"] / .[, "df.scaled"]) %>%
+  .[, c("chisq.scaled", "df.scaled", "chisq_df", "cfi.scaled", "rmsea.scaled",
+        "rmsea.ci.lower.scaled", "rmsea.ci.upper.scaled", "srmr")]
+
+MI_H = round(MI_H, 3)
+colnames(MI_H) = names_short
+```
+
+Differences in fit indices
+
+```{r}
+diff_H <- rbind(
+  conf_thres = fit_diff(H_fit1, H_fit2),
+  thres_load = fit_diff(H_fit2, H_fit3),
+  load_inter = fit_diff(H_fit3, H_fit4))
+```
+
+
+**All results**
+
+```{r}
+H_results = list(MI = MI_H,
+                  diff = diff_H)
+
+round(H_results$MI,3)
+round(H_results$diff,4)
+```
+
+### Remove objects
+
+```{r}
+rm(H_gad7)
+rm(H_mod1, H_mod2, H_mod3, H_mod4,
+   H_fit1, H_fit2, H_fit3, H_fit4)
+rm(MI_H, diff_H)
+
+rm(long_mod)
+rm(names_fit, names_short)
+```
+
+
+## Export results
+
+Descriptive
+
+```{r, eval=FALSE}
+writeLines(paste(
+    "<h2>Full sample</h2>",
+    as.character(fulldesc)),
+  "data/descriptivesLong.html")
+```
+
+Fit indices
+
+```{r, eval=FALSE}
+library(writexl)
+toexcel <- \(x) data.frame(model = rownames(x), x, check.names = FALSE)
+
+write_xlsx(list(
+  MI   = toexcel(full_results$MI),
+  diff = toexcel(full_results$diff)),
+  "data/LongMIfullsample_results.xlsx")
+
+write_xlsx(list(
+  W_MI   = toexcel(W_results$MI),
+  W_diff = toexcel(W_results$diff),
+  B_MI   = toexcel(B_results$MI),
+  B_diff = toexcel(B_results$diff),
+  H_MI   = toexcel(H_results$MI),
+  H_diff = toexcel(H_results$diff)),
+  "data/LongMIpergroup_results.xlsx")
+```
+
+```{r}
+rm(fulldesc)
+```
+
+
+# V. Score predictors
+
+## 1. Variable selection
+
+### 1.1. Fixed effects
+
+```{r}
+Anx_full_fit <- regsubsets(Anxiety ~ poly(Age,2) + Race + Sex + Mar + EduYears
+                                   + Cause + GCSTot + CTComp + Timepoint
+                                   + Race:Timepoint,
+                           data = Anx_Fscores, nvmax=20)
+```
+
+Number of models checked
+
+```{r}
+Anx_full_fit$xnames
+
+length(Anx_full_fit$xnames) - 1
+
+sapply(Anx_Fscores[c("Race", "Sex", "Mar", "EduYears",
+                   "Cause", "GCSTot", "CTComp", "Timepoint")], nlevels)
+
+ncol(model.matrix(Anxiety ~ poly(Age,2) + Race + Sex + Mar + EduYears
+                                   + Cause + GCSTot + CTComp + Timepoint
+                                   + Race:Timepoint,
+                           data = Anx_Fscores)) - 1
+```
+
+Select variables
+
+```{r}
+Anx_full_summary = summary(Anx_full_fit)
+
+par(mfrow = c(1, 3))
+plot(Anx_full_summary$adjr2, type = "b")
+abline(v = which.max(Anx_full_summary$adjr2), col = 2)
+plot(Anx_full_summary$cp, type = "b")
+abline(v = which.min(Anx_full_summary$cp), col = 2)
+plot(Anx_full_summary$bic, type = "b")
+abline(v = which.min(Anx_full_summary$bic), col = 2)
+```
+
+-   Following the AIC/CP indicator, we choose the model with 9
+
+```{r}
+Anx_full_summary$which[9,]
+```
+
+-   Included fixed effects:
+    - Age (poly)
+    - Race
+    - Sex
+    - Mar
+    - EduYears
+    - GCSTot
+    - Timepoint
+    - Race:Timepoint
+
+**Prepare age variable**
+
+```{r}
+Anx_Fscores <- Anx_Fscores  %>%
+  mutate(Age_z = as.numeric(scale(Age)))
+```
+
+### 1.2. Random effect
+
+```{r}
+# Fixed effects model
+Anx.null <- lm(Anxiety ~ Age_z + I(Age_z^2) + Race
+                       + Sex + Mar + EduYears + GCSTot
+                       + Timepoint + Race*Timepoint,
+               data=Anx_Fscores)
+# Random effects model
+Anx.lmer <- lmer(Anxiety ~ Age_z + I(Age_z^2) + Race
+                       + Sex + Mar + EduYears + GCSTot
+                       + Timepoint + Race*Timepoint + (1|UID),
+                 data=Anx_Fscores)
+```
+
+Comparison
+
+```{r}
+# LRT test
+mean(1 - pchisq(-2 * (logLik(Anx.null, REML = TRUE)
+                      - logLik(Anx.lmer, REML = TRUE)), df = c(0, 1)))
+
+# AIC and BIC
+merge(AIC(Anx.null, Anx.lmer), BIC(Anx.null, Anx.lmer), by = "df")
+
+# Proportion of variance
+performance::icc(Anx.lmer)
+```
+
+-   Small p-value, differences in fit indices and in ICC -\> There's significant variance between subjects -\> Thus, UID is included as a random effect
+
+### 1.3. Final model
+
+```{r}
+Anx_fit <- lmer(Anxiety ~ Age_z + I(Age_z^2) + Race
+                       + Sex + Mar + EduYears + GCSTot
+                       + Timepoint + Race*Timepoint + (1|UID),
+                 data=Anx_Fscores, REML = TRUE)
+```
+
+Check results
+
+```{r}
+summary(Anx_fit)$coefficients
+```
+
+Save the results
+
+```{r}
+write.xlsx(round(summary(Anx_fit)$coefficients, 3),
+           "data/LMM_coefficients.xlsx", rowNames=TRUE)
+```
+
+### Remove objects
+
+```{r}
+rm(Anx_full_fit, Anx_full_summary) # Fixed effects
+rm(Anx.null, Anx.lmer) # Random effect
+```
+
+## 2. Plotting
+
+### 2.1. Predicted scores
+
+```{r, eval=FALSE, message=FALSE}
+terms <- list(Age = "Age_z [all]", Sex = "Sex",
+              Mar = "Mar", EduYears = "EduYears",
+              GCSTot = "GCSTot", Race_Timepoint = c("Timepoint", "Race"))
+
+Anx_Pscores <- terms %>%
+  set_names() %>%
+  map(\(t) ggpredict(Anx_fit, terms = t))
+
+Anx_Pscores$Age$x <- Anx_Pscores$Age$x * sd(Anx_Fscores$Age) + mean(Anx_Fscores$Age)
+
+saveRDS(Anx_Pscores, "data/Anx_Pscores.rds")
+```
+
+```{r}
+Anx_Pscores <- readRDS("data/Anx_Pscores.rds")
+```
+
+### 2.2. Plots
+
+Range for the Y axis
+
+```{r}
+Yrange <- Anx_Pscores %>%
+  map(\(p) c(p$conf.low, p$conf.high)) %>%
+  unlist() %>%
+  range()
+```
+
+Individual plots
+
+```{r, message=FALSE}
+Age = plot_pred(model = Anx_fit, term = "Age_z [all]",
+                ci_level = 0.95, ylim = Yrange,
+                x_back = c(mean(Anx_Fscores$Age), sd(Anx_Fscores$Age)),
+                x_lab = "Age (years)", y_lab = "Predicted mean factor score")
+
+Sex = plot_pred(model = Anx_fit, term = "Sex",
+                ci_level = 0.95, ylim = Yrange,
+                x_lab = "Sex", y_lab="Predicted mean factor score")
+
+Mar = plot_pred(model = Anx_fit, term = "Mar",
+                ci_level = 0.95, ylim = Yrange,
+                x_lab = "Marital status", y_lab="Predicted mean factor score")
+
+EduYears = plot_pred(model = Anx_fit, term = "EduYears",
+                ci_level = 0.95, ylim = Yrange,
+                x_lab = "Years of education", y_lab="Predicted mean factor score")
+
+GCSTot = plot_pred(model = Anx_fit, term = "GCSTot",
+                ci_level = 0.95, ylim = Yrange,
+                x_lab = "Injury severity", y_lab="Predicted mean factor score")
+
+Race_Time = plot_pred(model = Anx_fit, term = "Timepoint", by = "Race",
+                      ci_level = 0.95, ylim = Yrange,
+                      x_lab = "Timepoint", y_lab="Predicted mean factor score")
+```
+
+## Export results
+
+Make and save grid
+
+```{r}
+plot_grid(list(Age, Sex, Mar, EduYears,
+               GCSTot, Race_Time),
+          margin=c(0,0,0,0), tags=TRUE)
+
+save_grid(list(Age, Sex, Mar, EduYears,
+               GCSTot, Race_Time),
+          "data/grid.png")
+```
+
+### Remove objects
+
+```{r}
+#rm(terms, Anx_Pscores, Yrange) # Scores and prep
+#rm(Age, Sex, Mar, EduYears, GCSTot, Race_Time) # Plots
+```
